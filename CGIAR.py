@@ -159,7 +159,15 @@ class AW_MIL_CropYield(nn.Module):
 
 def main():
     # Load data
-    train_df = pd.read_csv(os.path.join(DATA_DIR, "Train.csv"), header=None)
+    train_df = pd.read_csv(os.path.join(DATA_DIR, "Train.csv"))
+
+    # Clean and convert Yield to numeric
+    train_df['Yield'] = pd.to_numeric(train_df['Yield'], errors='coerce')
+    train_df = train_df.dropna(subset=['Yield']).reset_index(drop=True)
+
+    # Extract as numpy arrays (ensure numeric)
+    image_ids = train_df['ID'].values
+    targets = train_df['Yield'].values.astype(np.float32)  # <-- 关键！
     train_df.columns = ["Field_ID", "Year", "Quality", "Yield"]
     test_df = pd.read_csv(os.path.join(DATA_DIR, "test_field_ids_with_year.csv"))
     soil_climate = pd.read_excel(os.path.join(DATA_DIR, "samply.xlsx"), engine='openpyxl')
@@ -247,4 +255,5 @@ def main():
 if __name__ == "__main__":
 
     main()
+
 
