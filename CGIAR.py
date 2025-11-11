@@ -166,7 +166,7 @@ def main():
     train_df = train_df.dropna(subset=['Yield']).reset_index(drop=True)
 
     # Extract as numpy arrays (ensure numeric)
-    image_ids = train_df['ID'].values
+    image_ids = train_df['Field_ID'].values
     targets = train_df['Yield'].values.astype(np.float32)  # <-- 关键！
     train_df.columns = ["Field_ID", "Year", "Quality", "Yield"]
     test_df = pd.read_csv(os.path.join(DATA_DIR, "test_field_ids_with_year.csv"))
@@ -255,5 +255,6 @@ def main():
 if __name__ == "__main__":
 
     main()
+
 
 
