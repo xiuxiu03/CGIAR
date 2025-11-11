@@ -159,7 +159,7 @@ class AW_MIL_CropYield(nn.Module):
 
 def main():
     # Load data
-    train_df = pd.read_csv(os.path.join(DATA_DIR, "Train.csv"), header=None)
+    train_df = pd.read_csv(os.path.join("Train.csv"), header=None)
     train_df.columns = ["Field_ID", "Year", "Quality", "Yield"]
     test_df = pd.read_csv(os.path.join(DATA_DIR, "test_field_ids_with_year.csv"))
     soil_climate = pd.read_excel(os.path.join(DATA_DIR, "samply.xlsx"), engine='openpyxl')
@@ -245,4 +245,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
