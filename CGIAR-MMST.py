@@ -89,7 +89,7 @@ class MMSTViTDataset(Dataset):
 
 
 # ----------------------------
-# 模型组件定义 (简化版 MMST-ViT)
+# 手动实现 ViT 组件（无 timm）
 # ----------------------------
 
 class Mlp(nn.Module):
@@ -154,35 +154,54 @@ class Block(nn.Module):
         return x
 
 
+# ----------------------------
+# Patch Embedding with Padding
+# ----------------------------
+
 class PatchEmbed(nn.Module):
-    def __init__(self, img_size=(41, 41), patch_size=7, in_chans=1, embed_dim=768, temporal_dim=360):
+    def __init__(self, img_size=(41, 41), patch_size=7, in_chans=1, embed_dim=768):
         super().__init__()
         self.img_size = img_size
         self.patch_size = patch_size
         self.in_chans = in_chans
         self.embed_dim = embed_dim
-        self.temporal_dim = temporal_dim
 
-        self.grid_size = (img_size[0] // patch_size, img_size[1] // patch_size)
+        # Compute padding to make image divisible by patch_size
+        pad_h = (patch_size - img_size[0] % patch_size) % patch_size
+        pad_w = (patch_size - img_size[1] % patch_size) % patch_size
+        self.pad_h = pad_h
+        self.pad_w = pad_w
+
+        new_h = img_size[0] + pad_h
+        new_w = img_size[1] + pad_w
+        self.grid_size = (new_h // patch_size, new_w // patch_size)
         self.num_patches = self.grid_size[0] * self.grid_size[1]
 
         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
 
     def forward(self, x):
+        """
+        x: (B, T, H, W)
+        Returns: (B, T, num_patches, embed_dim)
+        """
         B, T, H, W = x.shape
-        pad_h = (self.patch_size - H % self.patch_size) % self.patch_size
-        pad_w = (self.patch_size - W % self.patch_size) % self.patch_size
-        if pad_h > 0 or pad_w > 0:
-            x = F.pad(x, (0, pad_w, 0, pad_h), mode='constant', value=0)
-            H, W = H + pad_h, W + pad_w
+        # Apply padding
+        if self.pad_h > 0 or self.pad_w > 0:
+            x = F.pad(x, (0, self.pad_w, 0, self.pad_h), mode='constant', value=0)
+            H += self.pad_h
+            W += self.pad_w
 
-        assert H % self.patch_size == 0 and W % self.patch_size == 0
-        x = x.view(B * T, self.in_chans, H, W)
-        x = self.proj(x)
-        x = x.flatten(2).transpose(1, 2)
-        x = x.view(B, T, self.num_patches, self.embed_dim)
+        # Reshape and apply conv
+        x = x.view(B * T, self.in_chans, H, W)  # (B*T, 1, H, W)
+        x = self.proj(x)  # (B*T, embed_dim, grid_h, grid_w)
+        x = x.flatten(2).transpose(1, 2)  # (B*T, num_patches, embed_dim)
+        x = x.view(B, T, self.num_patches, self.embed_dim)  # (B, T, num_patches, embed_dim)
         return x
 
+
+# ----------------------------
+# 模型组件
+# ----------------------------
 
 class MultiModalTransformer(nn.Module):
     def __init__(self, embed_dim=768, depth=2, num_heads=12, mlp_ratio=4., qkv_bias=True, norm_layer=nn.LayerNorm):
@@ -208,7 +227,10 @@ class TemporalTransformer(nn.Module):
         super().__init__()
         self.aux_proj = nn.Linear(aux_dim, embed_dim)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, 1 + 1, embed_dim))
+        # Positional embedding for [CLS] + T temporal tokens + 1 aux token → total T+2
+        # But we'll use fixed length = 1 (cls) + 1 (aux) = 2, and treat temporal as dynamic
+        # Simpler: only add pos embed to cls and aux (not full sequence)
+        self.pos_embed = nn.Parameter(torch.zeros(1, 2, embed_dim))  # cls + aux
 
         self.blocks = nn.Sequential(*[
             Block(embed_dim, num_heads, mlp_ratio, qkv_bias=qkv_bias, norm_layer=norm_layer)
@@ -223,19 +245,34 @@ class TemporalTransformer(nn.Module):
         torch.nn.init.normal_(self.pos_embed, std=.02)
 
     def forward(self, x, aux):
-        B, T, _ = x.shape
-        aux_proj = self.aux_proj(aux).unsqueeze(1)
-        x = torch.cat([x, aux_proj], dim=1)
+        """
+        x: (B, T, embed_dim) — e.g., global avg pooled spatial features over time
+        aux: (B, aux_dim)
+        """
+        B, T, D = x.shape
 
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        x = torch.cat([cls_tokens, x], dim=1)
+        # Project aux to same dim
+        aux_proj = self.aux_proj(aux).unsqueeze(1)  # (B, 1, D)
 
-        x = x + self.pos_embed
+        # Concatenate temporal features and aux → (B, T+1, D)
+        x = torch.cat([x, aux_proj], dim=1)  # (B, T+1, D)
 
+        # Add CLS token at front → (B, T+2, D)
+        cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, D)
+        x = torch.cat([cls_tokens, x], dim=1)  # (B, T+2, D)
+
+        # Add positional encoding only to first two tokens (cls and aux proxy)
+        # For simplicity, broadcast pos_embed to all positions (or just first two)
+        # Here we add pos_embed to cls and the last token (aux), others get 0
+        pos_tokens = torch.zeros_like(x)
+        pos_tokens[:, :2] = self.pos_embed  # Only first two get pos encoding
+        x = x + pos_tokens
+
+        # Apply transformer
         x = self.blocks(x)
         x = self.norm(x)
 
-        return x[:, 0]
+        return x[:, 0]  # (B, D)
 
 
 class SimplifiedMMSTViT(nn.Module):
@@ -244,36 +281,45 @@ class SimplifiedMMSTViT(nn.Module):
                  patch_size=7,
                  in_chans=1,
                  num_classes=1,
-                 embed_dim=768,
+                 embed_dim=256,
                  mm_depth=2,
                  temp_depth=2,
-                 num_heads=12,
+                 num_heads=8,
                  mlp_ratio=4.,
-                 aux_dim=64,
-                 temporal_dim=360):
+                 aux_dim=64):
         super().__init__()
-        self.embed_dim = embed_dim
-        self.temporal_dim = temporal_dim
+        self.patch_embed = PatchEmbed(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_chans=in_chans,
+            embed_dim=embed_dim
+        )
 
-        self.patch_embed = PatchEmbed(img_size=img_size, patch_size=patch_size,
-                                      in_chans=in_chans, embed_dim=embed_dim, temporal_dim=temporal_dim)
+        self.mm_transformer = MultiModalTransformer(
+            embed_dim=embed_dim,
+            depth=mm_depth,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio
+        )
 
-        self.mm_transformer = MultiModalTransformer(embed_dim=embed_dim, depth=mm_depth,
-                                                    num_heads=num_heads, mlp_ratio=mlp_ratio)
-
-        self.temporal_transformer = TemporalTransformer(embed_dim=embed_dim, aux_dim=aux_dim,
-                                                        depth=temp_depth, num_heads=num_heads,
-                                                        mlp_ratio=mlp_ratio)
+        self.temporal_transformer = TemporalTransformer(
+            embed_dim=embed_dim,
+            aux_dim=aux_dim,
+            depth=temp_depth,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio
+        )
 
         self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
     def forward(self, img, aux):
-        x = self.patch_embed(img)
-        x = self.mm_transformer(x)
-        x = x.mean(dim=2)
-        x = self.temporal_transformer(x, aux)
-        x = self.head(x)
-        return x.squeeze(-1)
+        # img: (B, 360, 41, 41)
+        x = self.patch_embed(img)  # (B, 360, num_patches, embed_dim)
+        x = self.mm_transformer(x)  # (B, 360, num_patches, embed_dim)
+        x = x.mean(dim=2)          # (B, 360, embed_dim)
+        x = self.temporal_transformer(x, aux)  # (B, embed_dim)
+        x = self.head(x)           # (B, 1)
+        return x.squeeze(-1)       # (B,)
 
 
 # ----------------------------
@@ -284,6 +330,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    # --- 数据加载 ---
     train_df = pd.read_csv(os.path.join(DATA_DIR, "Train.csv"))
     train_df['Yield'] = pd.to_numeric(train_df['Yield'], errors='coerce')
     train_df = train_df.dropna(subset=['Yield']).reset_index(drop=True)
@@ -292,8 +339,10 @@ def main():
     soil_climate = pd.read_excel(os.path.join(DATA_DIR, "samply.xlsx"), engine='openpyxl')
     soil_climate.set_index("Field_ID", inplace=True)
 
+    # --- 划分数据集 ---
     train_meta, val_meta = train_test_split(train_df, test_size=0.2, random_state=42)
 
+    # --- 构建数据集 ---
     train_dataset = MMSTViTDataset(train_meta, soil_climate, is_train=True)
     val_dataset = MMSTViTDataset(val_meta, soil_climate, is_train=True, aux_scaler=train_dataset.aux_scaler)
     test_dataset = MMSTViTDataset(test_df, soil_climate, is_train=False, aux_scaler=train_dataset.aux_scaler)
@@ -302,6 +351,7 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False, num_workers=4, pin_memory=True)
 
+    # --- 模型初始化 ---
     aux_dim = train_dataset.aux_feats.shape[1]
     model = SimplifiedMMSTViT(
         img_size=(41, 41),
@@ -312,14 +362,15 @@ def main():
         temp_depth=2,
         num_heads=8,
         mlp_ratio=4.,
-        aux_dim=aux_dim,
-        temporal_dim=360
+        aux_dim=aux_dim
     ).to(device)
 
+    # --- 优化器与损失函数 ---
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=30)
     criterion = nn.MSELoss()
 
+    # --- 训练循环 ---
     best_val_rmse = float('inf')
     num_epochs = 30
 
@@ -339,6 +390,7 @@ def main():
 
         scheduler.step()
 
+        # 验证
         model.eval()
         val_preds, val_targets = [], []
         with torch.no_grad():
@@ -359,6 +411,7 @@ def main():
             torch.save(model.state_dict(), os.path.join(DATA_DIR, "best_mmst_vit_model.pth"))
             print(f"New best model saved with Val RMSE: {best_val_rmse:.4f}")
 
+    # 测试预测
     print("Loading best model for inference...")
     model.load_state_dict(torch.load(os.path.join(DATA_DIR, "best_mmst_vit_model.pth")))
     model.eval()
