@@ -14,7 +14,7 @@ warnings.filterwarnings("ignore")
 # ----------------------------
 # 路径配置（假设所有 CSV 在当前目录）
 # ----------------------------
-DATA_DIR = "."
+DATA_DIR = "./data"
 
 train_file = os.path.join(DATA_DIR, "Train.csv")
 test_file = os.path.join(DATA_DIR, "test_field_ids_with_year.csv")
@@ -227,4 +227,5 @@ submission = pd.DataFrame({
     "Yield": np.clip(test_preds, 0, None)
 })
 submission.to_csv("submission_transformer.csv", index=False)
+
 print("\n✅ Submission saved to submission_transformer.csv")
