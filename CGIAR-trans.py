@@ -85,9 +85,6 @@ def build_features(df, aux_df):
 X_train, y_train = build_features(train_df, aux_df)
 X_test, _ = build_features(test_df, aux_df)
 
-# ----------------------------
-# 🔥 关键修复：清洗 NaN / Inf / 异常值
-# ----------------------------
 def clean_array(X):
     X = np.where(np.isinf(X), np.nan, X)          # inf → NaN
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)  # NaN/inf → 0
@@ -198,8 +195,7 @@ for epoch in range(50):
         best_val_rmse = val_rmse
         torch.save(model.state_dict(), "best_transformer.pth")
 
-    if epoch % 10 == 0 or epoch == 49:
-        print(f"Epoch {epoch+1:2d} | Val RMSE: {val_rmse:.4f} | Residual Variance: {val_var:.4f}")
+    print(f"Epoch {epoch+1:2d} | Val RMSE: {val_rmse:.4f} | Residual Variance: {val_var:.4f}")
 
 # ----------------------------
 # 最终评估
@@ -217,7 +213,7 @@ with torch.no_grad():
     final_rmse = np.sqrt(mean_squared_error(y_val, val_preds))
     final_var = np.var(y_val - val_preds)
 
-print("\n✅ Final Validation Metrics:")
+print("\n Final Validation Metrics:")
 print(f"RMSE: {final_rmse:.4f}")
 print(f"Residual Variance: {final_var:.4f}")
 
@@ -240,4 +236,5 @@ submission = pd.DataFrame({
     "Yield": np.clip(test_preds, 0, None)  # 禁止负产量
 })
 submission.to_csv("submission_transformer.csv", index=False)
-print("\n✅ Submission saved to submission_transformer.csv")
+print("\n Submission saved to submission_transformer.csv")
+
