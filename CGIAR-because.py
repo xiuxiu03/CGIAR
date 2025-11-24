@@ -20,6 +20,11 @@ test_file = os.path.join(DATA_DIR, "test_field_ids_with_year.csv")
 aux_file = os.path.join(DATA_DIR, "fields_w_additional_info.csv")
 
 # ----------------------------
+# 定义作物生长季（4月到9月，对应索引3~8）
+# ----------------------------
+GROWTH_MONTHS = list(range(3, 9))  # 0-based: Apr=3, May=4, ..., Sep=8
+
+# ----------------------------
 # 加载主数据
 # ----------------------------
 train_df = pd.read_csv(train_file, header=None)
@@ -32,9 +37,9 @@ aux_df = pd.read_csv(aux_file)
 aux_df.set_index("Field_ID", inplace=True)
 
 # ----------------------------
-# 辅助函数：构建结构化气候序列 + 土壤特征
+# 辅助函数：构建结构化气候序列 + 土壤特征（带生长季掩码）
 # ----------------------------
-def build_features_structured(df, aux_df):
+def build_features_structured(df, aux_df, growth_months=GROWTH_MONTHS):
     soil_cols = [col for col in aux_df.columns if col.startswith("soil_")]
     climate_seq_list = []
     soil_feat_list = []
@@ -50,9 +55,12 @@ def build_features_structured(df, aux_df):
             aux_row = aux_df.loc[fid]
             soil_feat = aux_row[soil_cols].values.astype(np.float32)
             
-            climate_seq = np.full((12, len(var_names)), np.nan, dtype=np.float32)
-            for month in range(12):
-                base = f"climate_{year}_{month+1}_"
+            # 初始化为 0（非生长季默认无影响）
+            climate_seq = np.zeros((12, len(var_names)), dtype=np.float32)
+            
+            # 仅填充生长季月份
+            for month in growth_months:
+                base = f"climate_{year}_{month+1}_"  # month is 0-based, so +1 for actual month
                 for j, var in enumerate(var_names):
                     col = f"{base}{var}"
                     if col in aux_row.index:
@@ -62,8 +70,9 @@ def build_features_structured(df, aux_df):
             climate_seq_list.append(climate_seq)
             soil_feat_list.append(soil_feat)
         else:
-            climate_seq_list.append(np.full((12, len(var_names)), np.nan, dtype=np.float32))
-            soil_feat_list.append(np.full(len(soil_cols), np.nan, dtype=np.float32))
+            # 若无辅助信息，全为0（包括土壤和气候）
+            climate_seq_list.append(np.zeros((12, len(var_names)), dtype=np.float32))
+            soil_feat_list.append(np.zeros(len(soil_cols), dtype=np.float32))
         
         if "Yield" in row:
             y_list.append(row["Yield"])
@@ -75,7 +84,7 @@ def build_features_structured(df, aux_df):
     return climate_seqs, soil_feats, y
 
 # ----------------------------
-# 清洗函数
+# 清洗函数（实际已由 build_features_structured 保证非 inf/NaN，但保留以防万一）
 # ----------------------------
 def clean_array_3d(X):
     X = np.where(np.isinf(X), np.nan, X)
@@ -109,7 +118,7 @@ y_train = np.clip(y_train, 0.0, 200.0)
 N, T, C = climate_train.shape
 S = soil_train.shape[1]
 
-# 气候标准化
+# 气候标准化（注意：非生长季为0，标准化后仍接近0）
 climate_train_flat = climate_train.reshape(-1, C)
 climate_scaler = StandardScaler()
 climate_train_scaled_flat = climate_scaler.fit_transform(climate_train_flat)
@@ -152,7 +161,7 @@ class YieldDataset(Dataset):
         return self.X[idx]
 
 # ----------------------------
-# Time-Shifted Transformer 模型
+# Time-Shifted Transformer 模型（保持不变）
 # ----------------------------
 class TimeShiftedTransformerYieldPredictor(nn.Module):
     def __init__(self, seq_len=12, input_dim=14+20, embed_dim=128, nhead=8, num_layers=2, dropout=0.1):
@@ -266,7 +275,7 @@ print("\n Final Validation Metrics:")
 print(f"RMSE: {final_rmse:.4f}")
 print(f"Residual Variance: {final_var:.4f}")
 
-# 可选：打印学习到的滞后权重（用于解释）
+# 打印学习到的滞后权重
 lag_weights = torch.softmax(model.lag_weights, dim=0).detach().cpu().numpy()
 print("\n Learned lag weights (month 1 to 12):")
 for i, w in enumerate(lag_weights, 1):
@@ -288,7 +297,7 @@ with torch.no_grad():
 
 submission = pd.DataFrame({
     "Field_ID": test_df["Field_ID"],
-    "Yield": np.clip(test_preds, 0, None)  # 禁止负产量
+    "Yield": np.clip(test_preds, 0, None)
 })
-submission.to_csv("submission_time_shifted_transformer.csv", index=False)
-print("\n Submission saved to submission_time_shifted_transformer.csv")
+submission.to_csv("submission_time_shifted_transformer_growing_season.csv", index=False)
+print("\n Submission saved to submission_time_shifted_transformer_growing_season.csv")
