@@ -4,7 +4,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import GroupShuffleSplit  # ← 新增
+from sklearn.model_selection import GroupShuffleSplit
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error
 import warnings
@@ -109,7 +109,6 @@ y_train = np.clip(y_train, 0.0, 200.0)
 N, T, C = climate_train.shape
 S = soil_train.shape[1]
 
-# 气候标准化
 climate_train_flat = climate_train.reshape(-1, C)
 climate_scaler = StandardScaler()
 climate_train_scaled_flat = climate_scaler.fit_transform(climate_train_flat)
@@ -118,20 +117,18 @@ climate_train_scaled = climate_train_scaled_flat.reshape(N, T, C)
 climate_test_flat = climate_test.reshape(-1, C)
 climate_test_scaled = climate_scaler.transform(climate_test_flat).reshape(-1, T, C)
 
-# 土壤标准化
 soil_scaler = StandardScaler()
 soil_train_scaled = soil_scaler.fit_transform(soil_train)
 soil_test_scaled = soil_scaler.transform(soil_test)
 
-# 拼接：每个时间步都包含土壤信息
-soil_train_tiled = np.tile(soil_train_scaled[:, None, :], (1, T, 1))  # (N, 12, S)
+soil_train_tiled = np.tile(soil_train_scaled[:, None, :], (1, T, 1))
 soil_test_tiled = np.tile(soil_test_scaled[:, None, :], (1, T, 1))
 
-X_train_full = np.concatenate([climate_train_scaled, soil_train_tiled], axis=-1)  # (N, 12, 14+S)
+X_train_full = np.concatenate([climate_train_scaled, soil_train_tiled], axis=-1)
 X_test_full = np.concatenate([climate_test_scaled, soil_test_tiled], axis=-1)
 
 # ----------------------------
-# ⭐ 关键修改：按 Field_ID 分组划分（避免数据泄露）
+# 按 Field_ID 分组划分
 # ----------------------------
 gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
 train_idx, val_idx = next(gss.split(X_train_full, y_train, groups=train_df["Field_ID"]))
@@ -140,8 +137,6 @@ X_tr, X_val = X_train_full[train_idx], X_train_full[val_idx]
 y_tr, y_val = y_train[train_idx], y_train[val_idx]
 
 print(f"Train samples: {len(X_tr)} | Val samples: {len(X_val)}")
-print(f"Unique Field_IDs in train: {train_df.iloc[train_idx]['Field_ID'].nunique()}")
-print(f"Unique Field_IDs in val:   {train_df.iloc[val_idx]['Field_ID'].nunique()}")
 
 # ----------------------------
 # Dataset
@@ -160,19 +155,21 @@ class YieldDataset(Dataset):
         return self.X[idx]
 
 # ----------------------------
-# Time-Shifted Transformer 模型
+# ⭐ 带月份位置编码的 Time-Shifted Transformer
 # ----------------------------
 class TimeShiftedTransformerYieldPredictor(nn.Module):
     def __init__(self, seq_len=12, input_dim=14+20, embed_dim=128, nhead=8, num_layers=2, dropout=0.1):
         super().__init__()
         self.seq_len = seq_len
         self.embedding = nn.Linear(input_dim, embed_dim)
+        # 新增：可学习月份嵌入
+        self.month_embedding = nn.Embedding(seq_len, embed_dim)
+        
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim, nhead=nhead, dropout=dropout, batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # 可学习滞后权重 αₖ
         self.lag_weights = nn.Parameter(torch.randn(seq_len))
         
         self.regressor = nn.Sequential(
@@ -182,15 +179,22 @@ class TimeShiftedTransformerYieldPredictor(nn.Module):
             nn.Linear(64, 1)
         )
 
-        # 因果掩码
         mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
         self.register_buffer("causal_mask", mask)
 
     def forward(self, x):
-        x = self.embedding(x)
-        out = self.transformer(x, mask=self.causal_mask)
-        weights = torch.softmax(self.lag_weights, dim=0)
-        weighted_repr = (out * weights.unsqueeze(0).unsqueeze(-1)).sum(dim=1)
+        B, L, D = x.shape
+        # 特征嵌入
+        x_feat = self.embedding(x)  # (B, L, E)
+        # 月份位置嵌入: months 0 to 11
+        month_ids = torch.arange(L, device=x.device).unsqueeze(0).expand(B, -1)  # (B, L)
+        x_month = self.month_embedding(month_ids)  # (B, L, E)
+        # 融合
+        x = x_feat + x_month  # (B, L, E)
+        
+        out = self.transformer(x, mask=self.causal_mask)  # (B, L, E)
+        weights = torch.softmax(self.lag_weights, dim=0)  # (L,)
+        weighted_repr = (out * weights.unsqueeze(0).unsqueeze(-1)).sum(dim=1)  # (B, E)
         return self.regressor(weighted_repr).squeeze(-1)
 
 # ----------------------------
@@ -242,18 +246,17 @@ for epoch in range(50):
     val_preds = np.concatenate(val_preds)
     val_targets = np.concatenate(val_targets)
     val_rmse = np.sqrt(mean_squared_error(val_targets, val_preds))
-    val_var = np.var(val_targets - val_preds)
 
     if val_rmse < best_val_rmse:
         best_val_rmse = val_rmse
-        torch.save(model.state_dict(), "best_time_shifted_transformer_groupsplit.pth")
+        torch.save(model.state_dict(), "best_model_with_month_embed.pth")
 
-    print(f"Epoch {epoch+1:2d} | Val RMSE: {val_rmse:.4f} | Residual Variance: {val_var:.4f}")
+    print(f"Epoch {epoch+1:2d} | Val RMSE: {val_rmse:.4f}")
 
 # ----------------------------
 # 最终评估
 # ----------------------------
-model.load_state_dict(torch.load("best_time_shifted_transformer_groupsplit.pth", map_location=device))
+model.load_state_dict(torch.load("best_model_with_month_embed.pth", map_location=device))
 model.eval()
 
 with torch.no_grad():
@@ -264,15 +267,12 @@ with torch.no_grad():
         val_preds.append(pred.cpu().numpy())
     val_preds = np.concatenate(val_preds)
     final_rmse = np.sqrt(mean_squared_error(y_val, val_preds))
-    final_var = np.var(y_val - val_preds)
 
-print("\n Final Validation Metrics (Group-Split):")
-print(f"RMSE: {final_rmse:.4f}")
-print(f"Residual Variance: {final_var:.4f}")
+print("\n Final Validation RMSE (with Month Embedding):", f"{final_rmse:.4f}")
 
-# 打印滞后权重
+# 打印学习到的月份重要性
 lag_weights = torch.softmax(model.lag_weights, dim=0).detach().cpu().numpy()
-print("\n Learned lag weights (month 1 to 12):")
+print("\n Learned lag weights (Month 1 to 12):")
 for i, w in enumerate(lag_weights, 1):
     print(f"  Month {i:2d}: {w:.4f}")
 
@@ -294,5 +294,5 @@ submission = pd.DataFrame({
     "Field_ID": test_df["Field_ID"],
     "Yield": np.clip(test_preds, 0, None)
 })
-submission.to_csv("submission_time_shifted_transformer_groupsplit.csv", index=False)
-print("\n Submission saved to submission_time_shifted_transformer_groupsplit.csv")
+submission.to_csv("submission_with_month_embed.csv", index=False)
+print("\n Submission saved to submission_with_month_embed.csv")
