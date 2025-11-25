@@ -4,18 +4,29 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import GroupShuffleSplit
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error
 import warnings
 warnings.filterwarnings("ignore")
 
+# ----------------------------
+# 路径配置
+# ----------------------------
 DATA_DIR = "./data"
+
 train_file = os.path.join(DATA_DIR, "Train.csv")
 test_file = os.path.join(DATA_DIR, "test_field_ids_with_year.csv")
 aux_file = os.path.join(DATA_DIR, "fields_w_additional_info.csv")
 
-# Load data
+# ----------------------------
+# 定义作物生长季（4月到9月，对应索引3~8）
+# ----------------------------
+GROWTH_MONTHS = list(range(3, 9))  # 0-based: Apr=3, May=4, ..., Sep=8
+
+# ----------------------------
+# 加载主数据
+# ----------------------------
 train_df = pd.read_csv(train_file, header=None)
 train_df.columns = ["Field_ID", "Year", "Quality", "Yield"]
 train_df['Yield'] = pd.to_numeric(train_df['Yield'], errors='coerce')
@@ -25,203 +36,184 @@ test_df = pd.read_csv(test_file)
 aux_df = pd.read_csv(aux_file)
 aux_df.set_index("Field_ID", inplace=True)
 
-def build_and_filter_features(df, aux_df, is_train=True):
+# ----------------------------
+# 辅助函数：构建结构化气候序列 + 土壤特征（带生长季掩码）
+# ----------------------------
+def build_features_structured(df, aux_df, growth_months=GROWTH_MONTHS):
     soil_cols = [col for col in aux_df.columns if col.startswith("soil_")]
-    var_names = ["aet", "def", "pdsi", "pet", "pr", "ro", "soil", "srad", "swe", "tmmn", "tmmx", "vap", "vpd", "vs"]
-    
-    valid_indices = []
-    climate_list = []
-    soil_list = []
+    climate_seq_list = []
+    soil_feat_list = []
     y_list = []
 
-    for idx, row in df.iterrows():
+    var_names = ["aet", "def", "pdsi", "pet", "pr", "ro", "soil", "srad", "swe", "tmmn", "tmmx", "vap", "vpd", "vs"]
+    
+    for _, row in df.iterrows():
         fid = row["Field_ID"]
         year = int(row["Year"])
         
-        if fid not in aux_df.index:
-            continue
+        if fid in aux_df.index:
+            aux_row = aux_df.loc[fid]
+            soil_feat = aux_row[soil_cols].values.astype(np.float32)
+            
+            # 初始化为 0（非生长季默认无影响）
+            climate_seq = np.zeros((12, len(var_names)), dtype=np.float32)
+            
+            # 仅填充生长季月份
+            for month in growth_months:
+                base = f"climate_{year}_{month+1}_"  # month is 0-based, so +1 for actual month
+                for j, var in enumerate(var_names):
+                    col = f"{base}{var}"
+                    if col in aux_row.index:
+                        val = aux_row[col]
+                        if isinstance(val, (int, float)) and not pd.isna(val):
+                            climate_seq[month, j] = float(val)
+            climate_seq_list.append(climate_seq)
+            soil_feat_list.append(soil_feat)
+        else:
+            climate_seq_list.append(np.zeros((12, len(var_names)), dtype=np.float32))
+            soil_feat_list.append(np.zeros(len(soil_cols), dtype=np.float32))
         
-        aux_row = aux_df.loc[fid]
-        
-        soil_vals = aux_row[soil_cols].values
-        if not np.issubdtype(soil_vals.dtype, np.number):
-            soil_vals = pd.to_numeric(soil_vals, errors='coerce')
-        soil_vals = soil_vals.astype(np.float64)
-        if np.all(~np.isfinite(soil_vals)):
-            continue
-        
-        climate_seq = np.full((12, len(var_names)), np.nan, dtype=np.float64)
-        for month in range(12):
-            base = f"climate_{year}_{month+1}_"
-            for j, var in enumerate(var_names):
-                col = f"{base}{var}"
-                if col in aux_row.index:
-                    val = aux_row[col]
-                    if isinstance(val, str):
-                        try:
-                            val = float(val)
-                        except:
-                            val = np.nan
-                    if np.isscalar(val) and np.isfinite(val):
-                        climate_seq[month, j] = float(val)
-        
-        if np.all(~np.isfinite(climate_seq)):
-            continue
-        
-        valid_indices.append(idx)
-        climate_list.append(climate_seq)
-        soil_list.append(soil_vals)
-        if is_train:
+        if "Yield" in row:
             y_list.append(row["Yield"])
     
-    if not climate_list:
-        raise ValueError("No valid samples after filtering!")
+    climate_seqs = np.stack(climate_seq_list)  # (N, 12, 14)
+    soil_feats = np.stack(soil_feat_list)      # (N, S)
+    y = np.array(y_list, dtype=np.float32) if y_list else None
     
-    climate_arr = np.stack(climate_list).astype(np.float64)
-    soil_arr = np.stack(soil_list).astype(np.float64)
-    y_arr = np.array(y_list, dtype=np.float64) if is_train else None
+    return climate_seqs, soil_feats, y
 
-    climate_arr = np.where(np.isfinite(climate_arr), climate_arr, np.nan)
-    soil_arr = np.where(np.isfinite(soil_arr), soil_arr, np.nan)
-    
-    return climate_arr, soil_arr, y_arr, valid_indices
+# ----------------------------
+# 清洗函数
+# ----------------------------
+def clean_array_3d(X):
+    X = np.where(np.isinf(X), np.nan, X)
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    X = np.clip(X, -1e6, 1e6)
+    return X.astype(np.float32)
 
-# Build features
-climate_train, soil_train, y_train, train_valid_idx = build_and_filter_features(train_df, aux_df, is_train=True)
-climate_test, soil_test, _, _ = build_and_filter_features(test_df, aux_df, is_train=False)
+def clean_array_2d(X):
+    X = np.where(np.isinf(X), np.nan, X)
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    X = np.clip(X, -1e6, 1e6)
+    return X.astype(np.float32)
 
-print(f"✅ Train: {len(climate_train)}, Test: {len(climate_test)}")
+# ----------------------------
+# 构建结构化特征
+# ----------------------------
+climate_train, soil_train, y_train = build_features_structured(train_df, aux_df)
+climate_test, soil_test, _ = build_features_structured(test_df, aux_df)
 
-train_df_filtered = train_df.iloc[train_valid_idx].reset_index(drop=True)
+climate_train = clean_array_3d(climate_train)
+climate_test = clean_array_3d(climate_test)
+soil_train = clean_array_2d(soil_train)
+soil_test = clean_array_2d(soil_test)
 
-# Safe standardization
-N, T, C_climate = climate_train.shape
-S_soil = soil_train.shape[1]
+y_train = np.nan_to_num(y_train, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+y_train = np.clip(y_train, 0.0, 200.0)
 
-soil_train_tiled_raw = np.tile(soil_train[:, None, :], (1, T, 1))
-soil_test_tiled_raw = np.tile(soil_test[:, None, :], (1, T, 1))
+# ----------------------------
+# 标准化
+# ----------------------------
+N, T, C = climate_train.shape
+S = soil_train.shape[1]
 
-X_train_raw = np.concatenate([climate_train, soil_train_tiled_raw], axis=-1)
-X_test_raw = np.concatenate([climate_test, soil_test_tiled_raw], axis=-1)
+climate_train_flat = climate_train.reshape(-1, C)
+climate_scaler = StandardScaler()
+climate_train_scaled_flat = climate_scaler.fit_transform(climate_train_flat)
+climate_train_scaled = climate_train_scaled_flat.reshape(N, T, C)
 
-D = X_train_raw.shape[-1]
-X_train_flat = X_train_raw.reshape(-1, D)
-X_test_flat = X_test_raw.reshape(-1, D)
+climate_test_flat = climate_test.reshape(-1, C)
+climate_test_scaled = climate_scaler.transform(climate_test_flat).reshape(-1, T, C)
 
-# Convert to float64 and clean
-X_train_flat = X_train_flat.astype(np.float64)
-X_test_flat = X_test_flat.astype(np.float64)
+soil_scaler = StandardScaler()
+soil_train_scaled = soil_scaler.fit_transform(soil_train)
+soil_test_scaled = soil_scaler.transform(soil_test)
 
-X_train_flat = np.where(np.isfinite(X_train_flat), X_train_flat, np.nan)
-X_test_flat = np.where(np.isfinite(X_test_flat), X_test_flat, np.nan)
+# 拼接：每个时间步都包含土壤信息（用于后续分离）
+soil_train_tiled = np.tile(soil_train_scaled[:, None, :], (1, T, 1))  # (N, 12, S)
+soil_test_tiled = np.tile(soil_test_scaled[:, None, :], (1, T, 1))
 
-# Fill NaN with column mean
-if np.isnan(X_train_flat).any():
-    col_means = np.nanmean(X_train_flat, axis=0)
-    col_means[np.isnan(col_means)] = 0.0
-    X_train_flat = np.where(np.isnan(X_train_flat), col_means, X_train_flat)
-    X_test_flat = np.where(np.isnan(X_test_flat), col_means, X_test_flat)
+X_train_full = np.concatenate([climate_train_scaled, soil_train_tiled], axis=-1)  # (N, 12, 14+S)
+X_test_full = np.concatenate([climate_test_scaled, soil_test_tiled], axis=-1)
 
-# Remove zero-variance columns
-variances = np.var(X_train_flat, axis=0)
-valid_cols = variances > 1e-8
-if not np.all(valid_cols):
-    print(f"🗑️ Removing {np.sum(~valid_cols)} zero-variance columns")
-    X_train_flat = X_train_flat[:, valid_cols]
-    X_test_flat = X_test_flat[:, valid_cols]
+# 划分验证集
+X_tr, X_val, y_tr, y_val = train_test_split(
+    X_train_full, y_train, test_size=0.2, random_state=42
+)
 
-scaler = StandardScaler()
-X_train_scaled_flat = scaler.fit_transform(X_train_flat)
-X_test_scaled_flat = scaler.transform(X_test_flat)
-
-D_new = X_train_scaled_flat.shape[1]
-X_train_full = X_train_scaled_flat.reshape(N, T, D_new)
-X_test_full = X_test_scaled_flat.reshape(-1, T, D_new)
-
-# Final safety: clip and convert to float32
-X_train_full = np.clip(X_train_full, -1e5, 1e5).astype(np.float32)
-X_test_full = np.clip(X_test_full, -1e5, 1e5).astype(np.float32)
-y_train = np.clip(y_train.astype(np.float32), 0.0, 200.0)
-
-# Validation function
-def assert_no_invalid(arr, name):
-    if np.any(~np.isfinite(arr)):
-        nan_c = np.isnan(arr).sum()
-        inf_c = np.isinf(arr).sum()
-        maxv = np.nanmax(np.abs(arr))
-        print(f"❌ {name}: NaN={nan_c}, Inf={inf_c}, Max={maxv}")
-        raise ValueError(f"{name} has invalid values")
-
-assert_no_invalid(X_train_full, "X_train_full")
-assert_no_invalid(X_test_full, "X_test_full")
-assert_no_invalid(y_train, "y_train")
-
-# Split
-gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-train_idx, val_idx = next(gss.split(X_train_full, y_train, groups=train_df_filtered["Field_ID"]))
-X_tr, X_val = X_train_full[train_idx], X_train_full[val_idx]
-y_tr, y_val = y_train[train_idx], y_train[val_idx]
-
-assert_no_invalid(X_tr, "X_tr")
-assert_no_invalid(X_val, "X_val")
-assert_no_invalid(y_tr, "y_tr")
-assert_no_invalid(y_val, "y_val")
-
-# Dataset with from_numpy
+# ----------------------------
+# Dataset
+# ----------------------------
 class YieldDataset(Dataset):
     def __init__(self, X, y=None):
-        self.X = torch.from_numpy(X)
-        self.y = torch.from_numpy(y) if y is not None else None
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.float32) if y is not None else None
+
     def __len__(self):
         return len(self.X)
-    def __getitem__(self, idx):
-        return (self.X[idx], self.y[idx]) if self.y is not None else self.X[idx]
 
-# Model (same as before)
+    def __getitem__(self, idx):
+        if self.y is not None:
+            return self.X[idx], self.y[idx]
+        return self.X[idx]
+
+# ----------------------------
+# Time-Shifted Transformer with FiLM
+# ----------------------------
 class TimeShiftedTransformerYieldPredictor(nn.Module):
-    def __init__(self, seq_len=12, input_dim=34, embed_dim=128, nhead=8, num_layers=2, dropout=0.1):
+    def __init__(self, seq_len=12, climate_dim=14, soil_dim=20, embed_dim=128, nhead=8, num_layers=2, dropout=0.1):
         super().__init__()
-        self.embedding = nn.Linear(input_dim, embed_dim)
-        self.month_embedding = nn.Embedding(seq_len, embed_dim)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=nhead, dropout=dropout, batch_first=True)
+        self.seq_len = seq_len
+        self.climate_dim = climate_dim
+        self.soil_dim = soil_dim
+        
+        self.embedding = nn.Linear(climate_dim, embed_dim)
+        self.gamma_proj = nn.Linear(soil_dim, embed_dim)
+        self.beta_proj = nn.Linear(soil_dim, embed_dim)
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=nhead, dropout=dropout, batch_first=True
+        )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.lag_logits = nn.Parameter(torch.randn(seq_len))
+        self.lag_weights = nn.Parameter(torch.randn(seq_len))
+        
         self.regressor = nn.Sequential(
             nn.Linear(embed_dim, 64),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(64, 1)
         )
+
         mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
         self.register_buffer("causal_mask", mask)
 
-    def get_lag_weights(self):
-        return torch.softmax(self.lag_logits, dim=0)
-
     def forward(self, x):
-        B, L, D = x.shape
-        x_feat = self.embedding(x)
-        month_ids = torch.arange(L, device=x.device).unsqueeze(0).expand(B, -1)
-        x_month = self.month_embedding(month_ids)
-        x = x_feat + x_month
-        out = self.transformer(x, mask=self.causal_mask)
-        weights = self.get_lag_weights()
+        B = x.shape[0]
+        climate_x = x[:, :, :self.climate_dim]   # (B, 12, 14)
+        soil_x = x[:, 0, self.climate_dim:]      # (B, soil_dim)
+
+        climate_embed = self.embedding(climate_x)  # (B, 12, E)
+
+        gamma = self.gamma_proj(soil_x).unsqueeze(1)  # (B, 1, E)
+        beta = self.beta_proj(soil_x).unsqueeze(1)    # (B, 1, E)
+        modulated = gamma * climate_embed + beta       # (B, 12, E)
+
+        out = self.transformer(modulated, mask=self.causal_mask)
+        weights = torch.softmax(self.lag_weights, dim=0)
         weighted_repr = (out * weights.unsqueeze(0).unsqueeze(-1)).sum(dim=1)
         return self.regressor(weighted_repr).squeeze(-1)
 
-def get_agricultural_prior(seq_len=12, growing_season=(3, 9)):
-    prior = np.zeros(seq_len)
-    prior[growing_season[0]:growing_season[1]] = 1.0
-    prior = prior / prior.sum()
-    return torch.tensor(prior, dtype=torch.float32)
-
-# Train
+# ----------------------------
+# 训练设置
+# ----------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-input_dim = X_tr.shape[-1]
+climate_dim = 14
+soil_dim = soil_train_scaled.shape[1]
 
 model = TimeShiftedTransformerYieldPredictor(
     seq_len=12,
-    input_dim=input_dim,
+    climate_dim=climate_dim,
+    soil_dim=soil_dim,
     embed_dim=128,
     nhead=8,
     num_layers=2,
@@ -229,27 +221,25 @@ model = TimeShiftedTransformerYieldPredictor(
 ).to(device)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
-criterion_mse = nn.MSELoss()
-agri_prior = get_agricultural_prior().to(device)
-lambda_kl = 0.1
+criterion = nn.MSELoss()
 
 train_dataset = YieldDataset(X_tr, y_tr)
 val_dataset = YieldDataset(X_val, y_val)
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 
+# ----------------------------
+# 训练循环
+# ----------------------------
 best_val_rmse = float('inf')
 for epoch in range(50):
     model.train()
     for x, y in train_loader:
         x, y = x.to(device), y.to(device)
         pred = model(x)
-        mse_loss = criterion_mse(pred, y)
-        learned_probs = model.get_lag_weights()
-        kl_loss = torch.sum(agri_prior * torch.log(agri_prior / (learned_probs + 1e-8)))
-        total_loss = mse_loss + lambda_kl * kl_loss
+        loss = criterion(pred, y)
         optimizer.zero_grad()
-        total_loss.backward()
+        loss.backward()
         optimizer.step()
 
     model.eval()
@@ -260,21 +250,22 @@ for epoch in range(50):
             pred = model(x)
             val_preds.append(pred.cpu().numpy())
             val_targets.append(y.cpu().numpy())
+    
     val_preds = np.concatenate(val_preds)
     val_targets = np.concatenate(val_targets)
     val_rmse = np.sqrt(mean_squared_error(val_targets, val_preds))
+    val_var = np.var(val_targets - val_preds)
 
     if val_rmse < best_val_rmse:
         best_val_rmse = val_rmse
-        torch.save(model.state_dict(), "best_model_kl_regularized.pth")
+        torch.save(model.state_dict(), "best_film_transformer.pth")
 
-    with torch.no_grad():
-        current_weights = model.get_lag_weights().cpu().numpy()
-        current_kl = np.sum(agri_prior.cpu().numpy() * np.log(agri_prior.cpu().numpy() / (current_weights + 1e-8)))
-    print(f"Epoch {epoch+1:2d} | Val RMSE: {val_rmse:.4f} | KL Loss: {current_kl:.4f}")
+    print(f"Epoch {epoch+1:2d} | Val RMSE: {val_rmse:.4f} | Residual Variance: {val_var:.4f}")
 
-# Submit
-model.load_state_dict(torch.load("best_model_kl_regularized.pth", map_location=device))
+# ----------------------------
+# 最终评估
+# ----------------------------
+model.load_state_dict(torch.load("best_film_transformer.pth", map_location=device))
 model.eval()
 
 with torch.no_grad():
@@ -283,16 +274,29 @@ with torch.no_grad():
         x = x.to(device)
         pred = model(x)
         val_preds.append(pred.cpu().numpy())
-    final_rmse = np.sqrt(mean_squared_error(y_val, np.concatenate(val_preds)))
-    print(f"\n🎯 Final Validation RMSE: {final_rmse:.4f}")
+    val_preds = np.concatenate(val_preds)
+    final_rmse = np.sqrt(mean_squared_error(y_val, val_preds))
+    final_var = np.var(y_val - val_preds)
 
-    lag_weights = model.get_lag_weights().detach().cpu().numpy()
-    print("\n📅 Learned lag weights (Month 1 to 12):")
-    for i, w in enumerate(lag_weights, 1):
-        print(f"  Month {i:2d}: {w:.4f}")
+print("\n Final Validation Metrics:")
+print(f"RMSE: {final_rmse:.4f}")
+print(f"Residual Variance: {final_var:.4f}")
 
-    test_dataset = YieldDataset(X_test_full)
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+# 打印学习到的滞后权重（关注哪几个月）
+lag_weights = torch.softmax(model.lag_weights, dim=0).detach().cpu().numpy()
+months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+print("\n Learned lag weights (month importance):")
+for i, (m, w) in enumerate(zip(months, lag_weights)):
+    marker = " <<< GROWTH" if i in GROWTH_MONTHS else ""
+    print(f"  {m}: {w:.4f}{marker}")
+
+# ----------------------------
+# 测试预测 & 提交
+# ----------------------------
+test_dataset = YieldDataset(X_test_full)
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+
+with torch.no_grad():
     test_preds = []
     for x in test_loader:
         x = x.to(device)
@@ -304,5 +308,5 @@ submission = pd.DataFrame({
     "Field_ID": test_df["Field_ID"],
     "Yield": np.clip(test_preds, 0, None)
 })
-submission.to_csv("submission_kl_regularized.csv", index=False)
-print(f"\n✅ Submission saved to 'submission_kl_regularized.csv'")
+submission.to_csv("submission_film_transformer_growing_season.csv", index=False)
+print("\n Submission saved to submission_film_transformer_growing_season.csv")
