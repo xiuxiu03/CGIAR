@@ -4,7 +4,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import GroupShuffleSplit  # ← 关键：按 Field_ID 分组划分
+from sklearn.model_selection import GroupShuffleSplit
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error
 import warnings
@@ -35,14 +35,10 @@ test_df = pd.read_csv(test_file)
 aux_df = pd.read_csv(aux_file)
 aux_df.set_index("Field_ID", inplace=True)
 
-# 创建 Field_ID 到 index 的映射
-all_field_ids = train_df["Field_ID"].unique()  # ← 仅用训练集 ID，确保测试集无冷启动
+# 创建 Field_ID 到 index 的映射（仅基于训练集）
+all_field_ids = train_df["Field_ID"].unique()
 field_id_to_idx = {fid: idx for idx, fid in enumerate(all_field_ids)}
 num_fields = len(all_field_ids)
-
-# 处理测试集：若 Field_ID 不在训练集中，回退到平均嵌入（但理想情况应覆盖）
-test_field_ids_in_train = test_df["Field_ID"].isin(field_id_to_idx)
-print(f"Test fields covered by training: {test_field_ids_in_train.sum()} / {len(test_df)}")
 
 # ----------------------------
 # 辅助函数：构建结构化气候序列 + 土壤特征
@@ -138,7 +134,7 @@ soil_test_tiled = np.tile(soil_test_scaled[:, None, :], (1, T, 1))
 X_train_full = np.concatenate([climate_train_scaled, soil_train_tiled], axis=-1)
 X_test_full = np.concatenate([climate_test_scaled, soil_test_tiled], axis=-1)
 
-# 转换 Field_ID 为索引（测试集中未见ID设为0，或可设为均值）
+# 转换 Field_ID 为索引（未见ID回退到0）
 train_field_indices = np.array([field_id_to_idx.get(fid, 0) for fid in train_field_ids])
 test_field_indices = np.array([field_id_to_idx.get(fid, 0) for fid in test_field_ids])
 
@@ -170,7 +166,7 @@ class YieldDataset(Dataset):
         return self.X[idx], self.field_ids[idx]
 
 # ----------------------------
-# 改进模型：特征注意力作用于 embedding 后 + Sigmoid + Field Dropout
+# 改进模型：特征注意力在 embedding 后 + Sigmoid + Field Dropout
 # ----------------------------
 class TimeShiftedTransformerYieldPredictor(nn.Module):
     def __init__(self, seq_len=12, input_dim=34, embed_dim=128, nhead=8, num_layers=2, dropout=0.1, num_fields=10000):
@@ -178,33 +174,26 @@ class TimeShiftedTransformerYieldPredictor(nn.Module):
         self.seq_len = seq_len
         self.embed_dim = embed_dim
         
-        # Field Embedding with Dropout
         self.field_embed = nn.Embedding(num_embeddings=num_fields, embedding_dim=16)
         self.field_dropout = nn.Dropout(dropout)
-        
-        # 主干 embedding
         self.input_embedding = nn.Linear(input_dim, embed_dim)
         
-        # 特征注意力网络（作用于 embedding 空间）
         self.feature_attn_net = nn.Sequential(
             nn.Linear(embed_dim + 16, 64),
             nn.ReLU(),
             nn.Linear(64, embed_dim),
-            nn.Sigmoid()  # ← 更灵活，不强制和为1
+            nn.Sigmoid()
         )
         
-        # Transformer Encoder（保留因果掩码）
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim, nhead=nhead, dropout=dropout, batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # 时间注意力（带先验）
         prior_logits = torch.tensor([1.0, 1.0, 1.5, 3.0, 3.5, 3.0, 2.0, 1.5, 1.0, 1.0, 1.0, 1.0])
         self.register_buffer("prior_logits", prior_logits)
         self.lag_weights = nn.Parameter(torch.log(prior_logits + 1e-6))
         
-        # 回归头
         self.regressor = nn.Sequential(
             nn.Linear(embed_dim, 64),
             nn.ReLU(),
@@ -212,32 +201,20 @@ class TimeShiftedTransformerYieldPredictor(nn.Module):
             nn.Linear(64, 1)
         )
 
-        # 保留因果掩码
         mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
         self.register_buffer("causal_mask", mask)
 
     def forward(self, x, field_ids):
         B, L, D = x.shape
-        
-        # Step 1: 输入嵌入
-        x_emb = self.input_embedding(x)  # (B, L, E)
-        
-        # Step 2: 获取 Field 嵌入
-        field_emb = self.field_dropout(self.field_embed(field_ids))  # (B, 16)
-        field_emb_exp = field_emb.unsqueeze(1).expand(-1, L, -1)     # (B, L, 16)
-        
-        # Step 3: 特征注意力（在 embedding 空间）
-        attn_input = torch.cat([x_emb, field_emb_exp], dim=-1)       # (B, L, E+16)
-        feat_weights = self.feature_attn_net(attn_input)             # (B, L, E)
-        x_emb_weighted = x_emb * feat_weights                         # (B, L, E)
-        
-        # Step 4: Transformer（带因果掩码）
-        out = self.transformer(x_emb_weighted, mask=self.causal_mask)  # (B, L, E)
-        
-        # Step 5: 时间注意力
-        time_weights = torch.softmax(self.lag_weights, dim=0)        # (L,)
-        weighted_repr = (out * time_weights.unsqueeze(0).unsqueeze(-1)).sum(dim=1)  # (B, E)
-        
+        x_emb = self.input_embedding(x)
+        field_emb = self.field_dropout(self.field_embed(field_ids))
+        field_emb_exp = field_emb.unsqueeze(1).expand(-1, L, -1)
+        attn_input = torch.cat([x_emb, field_emb_exp], dim=-1)
+        feat_weights = self.feature_attn_net(attn_input)
+        x_emb_weighted = x_emb * feat_weights
+        out = self.transformer(x_emb_weighted, mask=self.causal_mask)
+        time_weights = torch.softmax(self.lag_weights, dim=0)
+        weighted_repr = (out * time_weights.unsqueeze(0).unsqueeze(-1)).sum(dim=1)
         return self.regressor(weighted_repr).squeeze(-1)
 
     def get_kl_loss(self):
@@ -271,10 +248,10 @@ train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 
 # ----------------------------
-# 训练循环
+# 训练循环（含训练集 & 验证集 RMSE + 方差）
 # ----------------------------
 best_val_rmse = float('inf')
-LAMBDA_KL = 0.05  # 可尝试更小值
+LAMBDA_KL = 0.05
 
 for epoch in range(50):
     model.train()
@@ -289,7 +266,21 @@ for epoch in range(50):
         loss.backward()
         optimizer.step()
 
+    # --- 训练集评估 ---
     model.eval()
+    train_preds, train_targets = [], []
+    with torch.no_grad():
+        for x, field_ids, y in train_loader:
+            x, field_ids, y = x.to(device), field_ids.to(device), y.to(device)
+            pred = model(x, field_ids)
+            train_preds.append(pred.cpu().numpy())
+            train_targets.append(y.cpu().numpy())
+    train_preds = np.concatenate(train_preds)
+    train_targets = np.concatenate(train_targets)
+    train_rmse = np.sqrt(mean_squared_error(train_targets, train_preds))
+    train_var = np.var(train_targets - train_preds)
+
+    # --- 验证集评估 ---
     val_preds, val_targets = [], []
     with torch.no_grad():
         for x, field_ids, y in val_loader:
@@ -297,7 +288,6 @@ for epoch in range(50):
             pred = model(x, field_ids)
             val_preds.append(pred.cpu().numpy())
             val_targets.append(y.cpu().numpy())
-
     val_preds = np.concatenate(val_preds)
     val_targets = np.concatenate(val_targets)
     val_rmse = np.sqrt(mean_squared_error(val_targets, val_preds))
@@ -307,24 +297,35 @@ for epoch in range(50):
         best_val_rmse = val_rmse
         torch.save(model.state_dict(), "best_dacm_causal.pth")
 
-    print(f"Epoch {epoch+1:2d} | Val RMSE: {val_rmse:.4f} | Residual Variance: {val_var:.4f}")
+    print(f"Epoch {epoch+1:2d} | "
+          f"Train RMSE: {train_rmse:.4f}, Var: {train_var:.4f} | "
+          f"Val RMSE: {val_rmse:.4f}, Var: {val_var:.4f}")
 
 # ----------------------------
-# 最终评估 & 提交
+# 最终评估（加载最佳模型）
 # ----------------------------
 model.load_state_dict(torch.load("best_dacm_causal.pth", map_location=device))
 model.eval()
 
 with torch.no_grad():
-    val_preds = []
-    for x, field_ids, _ in val_loader:
-        x, field_ids = x.to(device), field_ids.to(device)
+    final_val_preds, final_val_targets = [], []
+    for x, field_ids, y in val_loader:
+        x, field_ids, y = x.to(device), field_ids.to(device), y.to(device)
         pred = model(x, field_ids)
-        val_preds.append(pred.cpu().numpy())
-    final_rmse = np.sqrt(mean_squared_error(y_val, np.concatenate(val_preds)))
-    print(f"\nFinal Val RMSE: {final_rmse:.4f}")
+        final_val_preds.append(pred.cpu().numpy())
+        final_val_targets.append(y.cpu().numpy())
+final_val_preds = np.concatenate(final_val_preds)
+final_val_targets = np.concatenate(final_val_targets)
+final_val_rmse = np.sqrt(mean_squared_error(final_val_targets, final_val_preds))
+final_val_var = np.var(final_val_targets - final_val_preds)
 
-# 测试预测
+print(f"\n✅ Final Best Model Performance:")
+print(f"   Validation RMSE: {final_val_rmse:.4f}")
+print(f"   Validation Residual Variance: {final_val_var:.4f}")
+
+# ----------------------------
+# 测试预测 & 提交
+# ----------------------------
 test_dataset = YieldDataset(X_test_full, test_field_indices)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
@@ -334,11 +335,11 @@ with torch.no_grad():
         x, field_ids = x.to(device), field_ids.to(device)
         pred = model(x, field_ids)
         test_preds.append(pred.cpu().numpy())
-    test_preds = np.concatenate(test_preds)
+test_preds = np.concatenate(test_preds)
 
 submission = pd.DataFrame({
     "Field_ID": test_df["Field_ID"],
     "Yield": np.clip(test_preds, 0, None)
 })
 submission.to_csv("submission_dacm_causal_improved.csv", index=False)
-print("\nSubmission saved.")
+print("\n📁 Submission saved.")
