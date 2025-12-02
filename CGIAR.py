@@ -1,260 +1,311 @@
-# ==============================
-# 玉米产量预测：AW-MIL + 辅助特征融合
-# 基于 Wang et al. (2025) "Learning county from pixels"
-# ==============================
-
 import os
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error
 import warnings
-
 warnings.filterwarnings("ignore")
 
 # ----------------------------
 # 路径配置
 # ----------------------------
 DATA_DIR = "./data"
-IMG_TRAIN_DIR = os.path.join(DATA_DIR, "Image_arrays_train")
-IMG_TEST_DIR = os.path.join(DATA_DIR, "Image_arrays_test")
-
+train_file = os.path.join(DATA_DIR, "Train.csv")
+test_file = os.path.join(DATA_DIR, "test_field_ids_with_year.csv")
+aux_file = os.path.join(DATA_DIR, "fields_w_additional_info.csv")
 
 # ----------------------------
-# 数据加载与预处理
+# 定义作物生长季（4月到9月，对应索引3~8）
 # ----------------------------
+GROWTH_MONTHS = list(range(3, 9))  # 0-based: Apr=3, May=4, ..., Sep=8
 
-def load_image(field_id, is_train=True, normalize=True):
-    folder = IMG_TRAIN_DIR if is_train else IMG_TEST_DIR
-    path = os.path.join(folder, f"{field_id}.npy")
-    if not os.path.exists(path):
-        return np.zeros((360, 41, 41), dtype=np.float32)
-    img = np.load(path).astype(np.float32)
-    if normalize:
-        min_val, max_val = img.min(), img.max()
-        if max_val > min_val:
-            img = (img - min_val) / (max_val - min_val)
+# ----------------------------
+# 加载主数据
+# ----------------------------
+train_df = pd.read_csv(train_file, header=None)
+train_df.columns = ["Field_ID", "Year", "Quality", "Yield"]
+train_df['Yield'] = pd.to_numeric(train_df['Yield'], errors='coerce')
+train_df = train_df.dropna(subset=['Yield']).reset_index(drop=True)
+
+test_df = pd.read_csv(test_file)
+aux_df = pd.read_csv(aux_file)
+aux_df.set_index("Field_ID", inplace=True)
+
+# ----------------------------
+# 辅助函数：构建结构化气候序列 + 土壤特征（带生长季掩码）
+# ----------------------------
+def build_features_structured(df, aux_df, growth_months=GROWTH_MONTHS):
+    soil_cols = [col for col in aux_df.columns if col.startswith("soil_")]
+    climate_seq_list = []
+    soil_feat_list = []
+    y_list = []
+    var_names = ["aet", "def", "pdsi", "pet", "pr", "ro", "soil", "srad", "swe", "tmmn", "tmmx", "vap", "vpd", "vs"]
+
+    for _, row in df.iterrows():
+        fid = row["Field_ID"]
+        year = int(row["Year"])
+        
+        if fid in aux_df.index:
+            aux_row = aux_df.loc[fid]
+            soil_feat = aux_row[soil_cols].values.astype(np.float32)
+            
+            # 初始化为 0（非生长季默认无影响）
+            climate_seq = np.zeros((12, len(var_names)), dtype=np.float32)
+            
+            # 仅填充生长季月份
+            for month in growth_months:
+                base = f"climate_{year}_{month+1}_"  # month is 0-based, so +1 for actual month
+                for j, var in enumerate(var_names):
+                    col = f"{base}{var}"
+                    if col in aux_row.index:
+                        val = aux_row[col]
+                        if isinstance(val, (int, float)) and not pd.isna(val):
+                            climate_seq[month, j] = float(val)
+            climate_seq_list.append(climate_seq)
+            soil_feat_list.append(soil_feat)
         else:
-            img = np.zeros_like(img)
-    return img
+            # 若无辅助信息，全为0
+            climate_seq_list.append(np.zeros((12, len(var_names)), dtype=np.float32))
+            soil_feat_list.append(np.zeros(len(soil_cols), dtype=np.float32))
+    
+        if "Yield" in row:
+            y_list.append(row["Yield"])
 
+    climate_seqs = np.stack(climate_seq_list)  # (N, 12, 14)
+    soil_feats = np.stack(soil_feat_list)      # (N, S)
+    y = np.array(y_list, dtype=np.float32) if y_list else None
 
-def get_aux_features(field_id, soil_climate_df):
-    if field_id in soil_climate_df.index:
-        return soil_climate_df.loc[field_id].values.astype(np.float32)
-    return np.zeros(soil_climate_df.shape[1], dtype=np.float32)
+    return climate_seqs, soil_feats, y
 
+# ----------------------------
+# 清洗函数
+# ----------------------------
+def clean_array_3d(X):
+    X = np.where(np.isinf(X), np.nan, X)
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    X = np.clip(X, -1e6, 1e6)
+    return X.astype(np.float32)
+
+def clean_array_2d(X):
+    X = np.where(np.isinf(X), np.nan, X)
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    X = np.clip(X, -1e6, 1e6)
+    return X.astype(np.float32)
+
+# ----------------------------
+# 构建结构化特征
+# ----------------------------
+climate_train, soil_train, y_train = build_features_structured(train_df, aux_df)
+climate_test, soil_test, _ = build_features_structured(test_df, aux_df)
+
+climate_train = clean_array_3d(climate_train)
+climate_test = clean_array_3d(climate_test)
+soil_train = clean_array_2d(soil_train)
+soil_test = clean_array_2d(soil_test)
+y_train = np.nan_to_num(y_train, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+y_train = np.clip(y_train, 0.0, 200.0)
+
+# ----------------------------
+# 标准化
+# ----------------------------
+N, T, C = climate_train.shape
+S = soil_train.shape[1]
+
+# 气候标准化
+climate_train_flat = climate_train.reshape(-1, C)
+climate_scaler = StandardScaler()
+climate_train_scaled_flat = climate_scaler.fit_transform(climate_train_flat)
+climate_train_scaled = climate_train_scaled_flat.reshape(N, T, C)
+
+climate_test_flat = climate_test.reshape(-1, C)
+climate_test_scaled = climate_scaler.transform(climate_test_flat).reshape(-1, T, C)
+
+# 土壤标准化
+soil_scaler = StandardScaler()
+soil_train_scaled = soil_scaler.fit_transform(soil_train)
+soil_test_scaled = soil_scaler.transform(soil_test)
+
+# 拼接：每个时间步都包含土壤信息
+soil_train_tiled = np.tile(soil_train_scaled[:, None, :], (1, T, 1))  # (N, 12, S)
+soil_test_tiled = np.tile(soil_test_scaled[:, None, :], (1, T, 1))
+
+X_train_full = np.concatenate([climate_train_scaled, soil_train_tiled], axis=-1)  # (N, 12, 14+S)
+X_test_full = np.concatenate([climate_test_scaled, soil_test_tiled], axis=-1)
+
+# 划分验证集
+X_tr, X_val, y_tr, y_val = train_test_split(
+    X_train_full, y_train, test_size=0.2, random_state=42
+)
 
 # ----------------------------
 # Dataset
 # ----------------------------
-
-class CropYieldDataset(Dataset):
-    def __init__(self, df, soil_climate, is_train=True, aux_scaler=None):
-        self.df = df.reset_index(drop=True)
-        self.soil_climate = soil_climate
-        self.is_train = is_train
-
-        self.images = []
-        self.aux_feats = []
-        self.targets = []
-
-        for _, row in self.df.iterrows():
-            fid = row["Field_ID"]
-            self.images.append(load_image(fid, is_train))
-            self.aux_feats.append(get_aux_features(fid, soil_climate))
-            if is_train:
-                self.targets.append(row["Yield"])
-
-        self.images = np.stack(self.images)  # (N, 360, 41, 41)
-        self.aux_feats = np.stack(self.aux_feats)  # (N, D_aux)
-
-        if aux_scaler is None:
-            self.aux_scaler = StandardScaler()
-            self.aux_feats = self.aux_scaler.fit_transform(self.aux_feats)
-        else:
-            self.aux_feats = aux_scaler.transform(self.aux_feats)
+class YieldDataset(Dataset):
+    def __init__(self, X, y=None):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.float32) if y is not None else None
 
     def __len__(self):
-        return len(self.df)
+        return len(self.X)
 
     def __getitem__(self, idx):
-        img = torch.tensor(self.images[idx])  # (360, 41, 41)
-        aux = torch.tensor(self.aux_feats[idx])  # (D_aux,)
-        if self.is_train:
-            y = torch.tensor(self.targets[idx], dtype=torch.float32)
-            return img, aux, y
-        return img, aux
-
+        if self.y is not None:
+            return self.X[idx], self.y[idx]
+        return self.X[idx]
 
 # ----------------------------
-# AW-MIL 模型（简化但保留核心）
+# Time-Shifted Transformer 模型（加入先验引导）
 # ----------------------------
-
-class AW_MIL_CropYield(nn.Module):
-    def __init__(self, aux_dim, img_channels=1, embed_dim=128, num_heads=4):
+class TimeShiftedTransformerYieldPredictor(nn.Module):
+    def __init__(self, seq_len=12, input_dim=14+20, embed_dim=128, nhead=8, num_layers=2, dropout=0.1):
         super().__init__()
-        self.embed_dim = embed_dim
-
-        # 图像编码器：1D CNN over time
-        self.temporal_conv = nn.Sequential(
-            nn.Conv1d(in_channels=img_channels * 41 * 41, out_channels=64, kernel_size=7, padding=3),
-            nn.ReLU(),
-            nn.Conv1d(in_channels=64, out_channels=embed_dim, kernel_size=5, padding=2),
-            nn.AdaptiveAvgPool1d(1)  # (B, E, 1)
+        self.seq_len = seq_len
+        self.embedding = nn.Linear(input_dim, embed_dim)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=nhead, dropout=dropout, batch_first=True
         )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # ===== 先验引导：关键生长阶段（4-6月最重要）=====
+        # 0-based: Jan=0, ..., Apr=3, May=4, Jun=5
+        prior_logits = torch.tensor([1.0, 1.0, 1.5, 3.0, 3.5, 3.0, 2.0, 1.5, 1.0, 1.0, 1.0, 1.0])
+        self.register_buffer("prior_logits", prior_logits)
+        # 初始化 lag_weights 为先验的 log，使初始 softmax 接近先验分布
+        self.lag_weights = nn.Parameter(torch.log(prior_logits + 1e-6))
+        # ================================================
 
-        # 辅助特征投影
-        self.aux_proj = nn.Linear(aux_dim, embed_dim)
-
-        # Attention weights for instances (here each field is one instance)
-        self.attention = nn.Sequential(
-            nn.Linear(embed_dim * 2, 64),
-            nn.Tanh(),
+        self.regressor = nn.Sequential(
+            nn.Linear(embed_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(64, 1)
         )
 
-        # 回归头
-        self.regressor = nn.Sequential(
-            nn.Linear(embed_dim * 2, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, 1)
-        )
+        mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
+        self.register_buffer("causal_mask", mask)
 
-    def forward(self, img, aux):
-        B = img.shape[0]
-        # Reshape image: (B, T, H, W) -> (B, C*H*W, T)
-        img = img.unsqueeze(1)  # (B, 1, 360, 41, 41)
-        img = img.view(B, 1 * 41 * 41, 360)  # (B, 1681, 360)
+    def forward(self, x):
+        x = self.embedding(x)  # (B, L, E)
+        out = self.transformer(x, mask=self.causal_mask)  # (B, L, E)
+        weights = torch.softmax(self.lag_weights, dim=0)  # (L,)
+        weighted_repr = (out * weights.unsqueeze(0).unsqueeze(-1)).sum(dim=1)  # (B, E)
+        return self.regressor(weighted_repr).squeeze(-1)
 
-        # Temporal encoding
-        img_emb = self.temporal_conv(img).squeeze(-1)  # (B, E)
-
-        # Aux encoding
-        aux_emb = self.aux_proj(aux)  # (B, E)
-
-        # Concatenate
-        combined = torch.cat([img_emb, aux_emb], dim=1)  # (B, 2E)
-
-        # Attention (for MIL; here trivial since 1 instance per bag)
-        att_weights = self.attention(combined)  # (B, 1)
-        att_weights = torch.softmax(att_weights, dim=0)  # across instances (if multiple)
-
-        # Weighted sum (still valid for single instance)
-        weighted_emb = att_weights * combined  # (B, 2E)
-
-        # Regression
-        out = self.regressor(weighted_emb).squeeze(-1)  # (B,)
-        return out
-
+    def get_kl_loss(self):
+        learned_probs = torch.softmax(self.lag_weights, dim=0)
+        prior_probs = torch.softmax(self.prior_logits, dim=0)
+        kl = torch.sum(prior_probs * torch.log((prior_probs + 1e-8) / (learned_probs + 1e-8)))
+        return kl
 
 # ----------------------------
-# 主流程
+# 训练设置
 # ----------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+input_dim = X_tr.shape[-1]  # 14 + S
 
-def main():
-    # Load data
-    train_df = pd.read_csv(os.path.join(DATA_DIR, "Train.csv"))
+model = TimeShiftedTransformerYieldPredictor(
+    seq_len=12,
+    input_dim=input_dim,
+    embed_dim=128,
+    nhead=8,
+    num_layers=2,
+    dropout=0.1
+).to(device)
 
-    # Clean and convert Yield to numeric
-    train_df['Yield'] = pd.to_numeric(train_df['Yield'], errors='coerce')
-    train_df = train_df.dropna(subset=['Yield']).reset_index(drop=True)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+criterion = nn.MSELoss()
 
-    # Extract as numpy arrays (ensure numeric)
-    image_ids = train_df['Field_ID'].values
-    targets = train_df['Yield'].values.astype(np.float32)  # <-- 关键！
-    train_df.columns = ["Field_ID", "Year", "Quality", "Yield"]
-    test_df = pd.read_csv(os.path.join(DATA_DIR, "test_field_ids_with_year.csv"))
-    soil_climate = pd.read_excel(os.path.join(DATA_DIR, "samply.xlsx"), engine='openpyxl')
-    soil_climate.set_index("Field_ID", inplace=True)
+train_dataset = YieldDataset(X_tr, y_tr)
+val_dataset = YieldDataset(X_val, y_val)
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 
-    # Train/Val split
-    train_meta, val_meta = train_test_split(train_df, test_size=0.2, random_state=42)
+# ----------------------------
+# 训练循环（加入 KL 正则项）
+# ----------------------------
+best_val_rmse = float('inf')
+LAMBDA_KL = 0.1  # 先验强度超参数，可调
 
-    # Datasets
-    train_dataset = CropYieldDataset(train_meta, soil_climate, is_train=True)
-    val_dataset = CropYieldDataset(val_meta, soil_climate, is_train=True, aux_scaler=train_dataset.aux_scaler)
-    test_dataset = CropYieldDataset(test_df, soil_climate, is_train=False, aux_scaler=train_dataset.aux_scaler)
+for epoch in range(50):
+    model.train()
+    for x, y in train_loader:
+        x, y = x.to(device), y.to(device)
+        pred = model(x)
+        loss_pred = criterion(pred, y)
+        loss_kl = LAMBDA_KL * model.get_kl_loss()
+        loss = loss_pred + loss_kl
+        
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
-    # DataLoaders
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
-
-    # Model
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = AW_MIL_CropYield(aux_dim=train_dataset.aux_feats.shape[1]).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
-    criterion = nn.MSELoss()
-
-    # Training loop
-    best_val_rmse = float('inf')
-    for epoch in range(30):
-        model.train()
-        train_loss = 0.0
-        train_mse = 0.0
-        for img, aux, y in train_loader:
-            img, aux, y = img.to(device), aux.to(device), y.to(device)
-            pred = model(img, aux)
-            loss = criterion(pred, y)  # MSE loss
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
-            train_mse += loss.item()  # since criterion is MSE
-
-        # Validation
-        model.eval()
-        val_mse = 0.0
-        with torch.no_grad():
-            for img, aux, y in val_loader:
-                img, aux, y = img.to(device), aux.to(device), y.to(device)
-                pred = model(img, aux)
-                val_mse += criterion(pred, y).item()
-
-        # Compute averages
-        train_mse /= len(train_loader)
-        val_mse /= len(val_loader)
-        train_rmse = np.sqrt(train_mse)
-        val_rmse = np.sqrt(val_mse)
-
-        print(f"Epoch {epoch + 1:2d} | "
-              f"Train MSE: {train_mse:.4f} | Train RMSE: {train_rmse:.4f} | "
-              f"Val MSE: {val_mse:.4f} | Val RMSE: {val_rmse:.4f}")
-
-        # Save best model based on RMSE
-        if val_rmse < best_val_rmse:
-            best_val_rmse = val_rmse
-            torch.save(model.state_dict(), os.path.join(DATA_DIR, "best_model.pth"))
-            print(f"New best RMSE: {best_val_rmse:.4f} — model saved.")
-
-    # Test prediction
-    model.load_state_dict(torch.load(os.path.join(DATA_DIR, "best_model.pth")))
+    # 验证
     model.eval()
-    preds = []
+    val_preds, val_targets = [], []
     with torch.no_grad():
-        for img, aux in test_loader:
-            img, aux = img.to(device), aux.to(device)
-            pred = model(img, aux)
-            preds.extend(pred.cpu().numpy())
+        for x, y in val_loader:
+            x, y = x.to(device), y.to(device)
+            pred = model(x)
+            val_preds.append(pred.cpu().numpy())
+            val_targets.append(y.cpu().numpy())
 
-    # Save submission
-    submission = pd.DataFrame({
-        "Field_ID": test_df["Field_ID"],
-        "Yield": np.clip(preds, 0, None)  # 防止负产量
-    })
-    submission.to_csv(os.path.join(DATA_DIR, "submission_AW_MIL.csv"), index=False)
-    print("Submission saved to submission_AW_MIL.csv")
+    val_preds = np.concatenate(val_preds)
+    val_targets = np.concatenate(val_targets)
+    val_rmse = np.sqrt(mean_squared_error(val_targets, val_preds))
+    val_var = np.var(val_targets - val_preds)
 
+    if val_rmse < best_val_rmse:
+        best_val_rmse = val_rmse
+        torch.save(model.state_dict(), "best_time_shifted_transformer.pth")
 
-if __name__ == "__main__":
+    print(f"Epoch {epoch+1:2d} | Val RMSE: {val_rmse:.4f} | Residual Variance: {val_var:.4f}")
 
-    main()
+# ----------------------------
+# 最终评估
+# ----------------------------
+model.load_state_dict(torch.load("best_time_shifted_transformer.pth", map_location=device))
+model.eval()
+with torch.no_grad():
+    val_preds = []
+    for x, _ in val_loader:
+        x = x.to(device)
+        pred = model(x)
+        val_preds.append(pred.cpu().numpy())
+    val_preds = np.concatenate(val_preds)
+    final_rmse = np.sqrt(mean_squared_error(y_val, val_preds))
+    final_var = np.var(y_val - val_preds)
 
+print("\n Final Validation Metrics:")
+print(f"RMSE: {final_rmse:.4f}")
+print(f"Residual Variance: {final_var:.4f}")
 
+# 打印学习到的滞后权重（体现先验是否生效）
+lag_weights = torch.softmax(model.lag_weights, dim=0).detach().cpu().numpy()
+print("\n Learned lag weights (month 1 to 12):")
+for i, w in enumerate(lag_weights, 1):
+    print(f"  Month {i:2d}: {w:.4f}")
 
+# ----------------------------
+# 测试预测 & 提交
+# ----------------------------
+test_dataset = YieldDataset(X_test_full)
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+
+with torch.no_grad():
+    test_preds = []
+    for x in test_loader:
+        x = x.to(device)
+        pred = model(x)
+        test_preds.append(pred.cpu().numpy())
+    test_preds = np.concatenate(test_preds)
+
+submission = pd.DataFrame({
+    "Field_ID": test_df["Field_ID"],
+    "Yield": np.clip(test_preds, 0, None)
+})
+submission.to_csv("submission_time_shifted_transformer_growing_season.csv", index=False)
+print("\n Submission saved to submission_time_shifted_transformer_growing_season.csv")
