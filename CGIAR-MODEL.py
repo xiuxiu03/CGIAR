@@ -4,7 +4,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit  # ← 关键：按 Field_ID 分组划分
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error
 import warnings
@@ -21,7 +21,7 @@ aux_file = os.path.join(DATA_DIR, "fields_w_additional_info.csv")
 # ----------------------------
 # 定义作物生长季（4月到9月，对应索引3~8）
 # ----------------------------
-GROWTH_MONTHS = list(range(3, 9))  # 0-based: Apr=3, May=4, ..., Sep=8
+GROWTH_MONTHS = list(range(3, 9))  # Apr=3, ..., Sep=8
 
 # ----------------------------
 # 加载主数据
@@ -35,20 +35,24 @@ test_df = pd.read_csv(test_file)
 aux_df = pd.read_csv(aux_file)
 aux_df.set_index("Field_ID", inplace=True)
 
-# 创建 Field_ID 到 index 的映射（用于嵌入）
-all_field_ids = pd.concat([train_df["Field_ID"], test_df["Field_ID"]]).unique()
+# 创建 Field_ID 到 index 的映射
+all_field_ids = train_df["Field_ID"].unique()  # ← 仅用训练集 ID，确保测试集无冷启动
 field_id_to_idx = {fid: idx for idx, fid in enumerate(all_field_ids)}
 num_fields = len(all_field_ids)
 
+# 处理测试集：若 Field_ID 不在训练集中，回退到平均嵌入（但理想情况应覆盖）
+test_field_ids_in_train = test_df["Field_ID"].isin(field_id_to_idx)
+print(f"Test fields covered by training: {test_field_ids_in_train.sum()} / {len(test_df)}")
+
 # ----------------------------
-# 辅助函数：构建结构化气候序列 + 土壤特征（带生长季掩码）
+# 辅助函数：构建结构化气候序列 + 土壤特征
 # ----------------------------
 def build_features_structured(df, aux_df, growth_months=GROWTH_MONTHS):
     soil_cols = [col for col in aux_df.columns if col.startswith("soil_")]
     climate_seq_list = []
     soil_feat_list = []
     y_list = []
-    field_id_list = []  # ← 新增：记录 Field_ID
+    field_id_list = []
     var_names = ["aet", "def", "pdsi", "pet", "pr", "ro", "soil", "srad", "swe", "tmmn", "tmmx", "vap", "vpd", "vs"]
 
     for _, row in df.iterrows():
@@ -58,7 +62,6 @@ def build_features_structured(df, aux_df, growth_months=GROWTH_MONTHS):
         if fid in aux_df.index:
             aux_row = aux_df.loc[fid]
             soil_feat = aux_row[soil_cols].values.astype(np.float32)
-            
             climate_seq = np.zeros((12, len(var_names)), dtype=np.float32)
             for month in growth_months:
                 base = f"climate_{year}_{month+1}_"
@@ -76,7 +79,7 @@ def build_features_structured(df, aux_df, growth_months=GROWTH_MONTHS):
     
         if "Yield" in row:
             y_list.append(row["Yield"])
-        field_id_list.append(fid)  # ← 记录
+        field_id_list.append(fid)
 
     climate_seqs = np.stack(climate_seq_list)
     soil_feats = np.stack(soil_feat_list)
@@ -132,23 +135,25 @@ soil_test_scaled = soil_scaler.transform(soil_test)
 soil_train_tiled = np.tile(soil_train_scaled[:, None, :], (1, T, 1))
 soil_test_tiled = np.tile(soil_test_scaled[:, None, :], (1, T, 1))
 
-X_train_full = np.concatenate([climate_train_scaled, soil_train_tiled], axis=-1)  # (N, 12, input_dim)
+X_train_full = np.concatenate([climate_train_scaled, soil_train_tiled], axis=-1)
 X_test_full = np.concatenate([climate_test_scaled, soil_test_tiled], axis=-1)
 
-# 转换 Field_ID 为索引
-train_field_indices = np.array([field_id_to_idx[fid] for fid in train_field_ids])
-test_field_indices = np.array([field_id_to_idx[fid] for fid in test_field_ids])
+# 转换 Field_ID 为索引（测试集中未见ID设为0，或可设为均值）
+train_field_indices = np.array([field_id_to_idx.get(fid, 0) for fid in train_field_ids])
+test_field_indices = np.array([field_id_to_idx.get(fid, 0) for fid in test_field_ids])
 
-# 划分验证集（注意同步划分 field indices）
-indices = np.arange(len(X_train_full))
-tr_idx, val_idx = train_test_split(indices, test_size=0.2, random_state=42)
+# ----------------------------
+# 按 Field_ID 分组划分（防止数据泄露）
+# ----------------------------
+gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+tr_idx, val_idx = next(gss.split(X_train_full, groups=train_df["Field_ID"]))
 
 X_tr, X_val = X_train_full[tr_idx], X_train_full[val_idx]
 y_tr, y_val = y_train[tr_idx], y_train[val_idx]
 field_tr, field_val = train_field_indices[tr_idx], train_field_indices[val_idx]
 
 # ----------------------------
-# Dataset（新增返回 field_id index）
+# Dataset
 # ----------------------------
 class YieldDataset(Dataset):
     def __init__(self, X, field_ids, y=None):
@@ -165,39 +170,41 @@ class YieldDataset(Dataset):
         return self.X[idx], self.field_ids[idx]
 
 # ----------------------------
-# 改进模型：加入特征注意力 + 因子异质性
+# 改进模型：特征注意力作用于 embedding 后 + Sigmoid + Field Dropout
 # ----------------------------
 class TimeShiftedTransformerYieldPredictor(nn.Module):
-    def __init__(self, seq_len=12, input_dim=14+20, embed_dim=128, nhead=8, num_layers=2, dropout=0.1, num_fields=10000):
+    def __init__(self, seq_len=12, input_dim=34, embed_dim=128, nhead=8, num_layers=2, dropout=0.1, num_fields=10000):
         super().__init__()
         self.seq_len = seq_len
-        self.input_dim = input_dim
         self.embed_dim = embed_dim
         
-        # Field ID 嵌入（用于异质性）
-        self.field_embed = nn.Embedding(num_embeddings=num_fields, embedding_dim=32)
+        # Field Embedding with Dropout
+        self.field_embed = nn.Embedding(num_embeddings=num_fields, embedding_dim=16)
+        self.field_dropout = nn.Dropout(dropout)
         
-        # 特征注意力网络（接收 [input_dim + field_emb] → 输出特征权重）
+        # 主干 embedding
+        self.input_embedding = nn.Linear(input_dim, embed_dim)
+        
+        # 特征注意力网络（作用于 embedding 空间）
         self.feature_attn_net = nn.Sequential(
-            nn.Linear(input_dim + 32, 64),
+            nn.Linear(embed_dim + 16, 64),
             nn.ReLU(),
-            nn.Linear(64, input_dim),
-            nn.Softmax(dim=-1)
+            nn.Linear(64, embed_dim),
+            nn.Sigmoid()  # ← 更灵活，不强制和为1
         )
         
-        # 主干 Transformer
-        self.embedding = nn.Linear(input_dim, embed_dim)
+        # Transformer Encoder（保留因果掩码）
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim, nhead=nhead, dropout=dropout, batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # ===== 时间注意力（保留先验）=====
+        # 时间注意力（带先验）
         prior_logits = torch.tensor([1.0, 1.0, 1.5, 3.0, 3.5, 3.0, 2.0, 1.5, 1.0, 1.0, 1.0, 1.0])
         self.register_buffer("prior_logits", prior_logits)
         self.lag_weights = nn.Parameter(torch.log(prior_logits + 1e-6))
-        # =================================
-
+        
+        # 回归头
         self.regressor = nn.Sequential(
             nn.Linear(embed_dim, 64),
             nn.ReLU(),
@@ -205,27 +212,32 @@ class TimeShiftedTransformerYieldPredictor(nn.Module):
             nn.Linear(64, 1)
         )
 
+        # 保留因果掩码
         mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
         self.register_buffer("causal_mask", mask)
 
     def forward(self, x, field_ids):
-        B, L, D = x.shape  # (B, 12, input_dim)
+        B, L, D = x.shape
         
-        # --- Step 1: 特征注意力（带地块异质性）---
-        field_emb = self.field_embed(field_ids)  # (B, 32)
-        field_emb_expanded = field_emb.unsqueeze(1).expand(-1, L, -1)  # (B, 12, 32)
-        attn_input = torch.cat([x, field_emb_expanded], dim=-1)  # (B, 12, input_dim+32)
-        feat_weights = self.feature_attn_net(attn_input)  # (B, 12, input_dim)
-        x_weighted = x * feat_weights  # (B, 12, input_dim)
-
-        # --- Step 2: Transformer 编码 ---
-        x_emb = self.embedding(x_weighted)  # (B, L, E)
-        out = self.transformer(x_emb, mask=self.causal_mask)  # (B, L, E)
-
-        # --- Step 3: 时间注意力（带先验）---
-        time_weights = torch.softmax(self.lag_weights, dim=0)  # (L,)
+        # Step 1: 输入嵌入
+        x_emb = self.input_embedding(x)  # (B, L, E)
+        
+        # Step 2: 获取 Field 嵌入
+        field_emb = self.field_dropout(self.field_embed(field_ids))  # (B, 16)
+        field_emb_exp = field_emb.unsqueeze(1).expand(-1, L, -1)     # (B, L, 16)
+        
+        # Step 3: 特征注意力（在 embedding 空间）
+        attn_input = torch.cat([x_emb, field_emb_exp], dim=-1)       # (B, L, E+16)
+        feat_weights = self.feature_attn_net(attn_input)             # (B, L, E)
+        x_emb_weighted = x_emb * feat_weights                         # (B, L, E)
+        
+        # Step 4: Transformer（带因果掩码）
+        out = self.transformer(x_emb_weighted, mask=self.causal_mask)  # (B, L, E)
+        
+        # Step 5: 时间注意力
+        time_weights = torch.softmax(self.lag_weights, dim=0)        # (L,)
         weighted_repr = (out * time_weights.unsqueeze(0).unsqueeze(-1)).sum(dim=1)  # (B, E)
-
+        
         return self.regressor(weighted_repr).squeeze(-1)
 
     def get_kl_loss(self):
@@ -262,7 +274,7 @@ val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 # 训练循环
 # ----------------------------
 best_val_rmse = float('inf')
-LAMBDA_KL = 0.1
+LAMBDA_KL = 0.05  # 可尝试更小值
 
 for epoch in range(50):
     model.train()
@@ -293,38 +305,26 @@ for epoch in range(50):
 
     if val_rmse < best_val_rmse:
         best_val_rmse = val_rmse
-        torch.save(model.state_dict(), "best_dacm_like_model.pth")
+        torch.save(model.state_dict(), "best_dacm_causal.pth")
 
     print(f"Epoch {epoch+1:2d} | Val RMSE: {val_rmse:.4f} | Residual Variance: {val_var:.4f}")
 
 # ----------------------------
-# 最终评估
+# 最终评估 & 提交
 # ----------------------------
-model.load_state_dict(torch.load("best_dacm_like_model.pth", map_location=device))
+model.load_state_dict(torch.load("best_dacm_causal.pth", map_location=device))
 model.eval()
+
 with torch.no_grad():
     val_preds = []
     for x, field_ids, _ in val_loader:
         x, field_ids = x.to(device), field_ids.to(device)
         pred = model(x, field_ids)
         val_preds.append(pred.cpu().numpy())
-    val_preds = np.concatenate(val_preds)
-    final_rmse = np.sqrt(mean_squared_error(y_val, val_preds))
-    final_var = np.var(y_val - val_preds)
+    final_rmse = np.sqrt(mean_squared_error(y_val, np.concatenate(val_preds)))
+    print(f"\nFinal Val RMSE: {final_rmse:.4f}")
 
-print("\n Final Validation Metrics:")
-print(f"RMSE: {final_rmse:.4f}")
-print(f"Residual Variance: {final_var:.4f}")
-
-# 打印时间注意力权重
-lag_weights = torch.softmax(model.lag_weights, dim=0).detach().cpu().numpy()
-print("\n Learned lag weights (time attention, month 1 to 12):")
-for i, w in enumerate(lag_weights, 1):
-    print(f"  Month {i:2d}: {w:.4f}")
-
-# ----------------------------
-# 测试预测 & 提交
-# ----------------------------
+# 测试预测
 test_dataset = YieldDataset(X_test_full, test_field_indices)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
@@ -340,5 +340,5 @@ submission = pd.DataFrame({
     "Field_ID": test_df["Field_ID"],
     "Yield": np.clip(test_preds, 0, None)
 })
-submission.to_csv("submission_dacm_like_with_prior.csv", index=False)
-print("\n Submission saved to submission_dacm_like_with_prior.csv")
+submission.to_csv("submission_dacm_causal_improved.csv", index=False)
+print("\nSubmission saved.")
