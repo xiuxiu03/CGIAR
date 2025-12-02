@@ -15,7 +15,7 @@ warnings.filterwarnings("ignore")
 # ----------------------------
 DATA_DIR = "./data"
 train_path = os.path.join(DATA_DIR, "Train.csv")
-test_path = os.path.join(DATA_DIR, "Test.csv")  # 必须包含真实 Yield 列（4列）
+test_path = os.path.join(DATA_DIR, "test_field_ids_with_year.csv")  # 必须包含真实 Yield 列（4列）
 aux_path = os.path.join(DATA_DIR, "fields_w_additional_info.csv")
 
 # ----------------------------
@@ -275,3 +275,4 @@ pd.DataFrame({
     "Pred_Yield": test_preds
 }).to_csv("test_predictions.csv", index=False)
 print("Test predictions saved to 'test_predictions.csv'")
+
