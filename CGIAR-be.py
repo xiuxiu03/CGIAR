@@ -10,6 +10,18 @@ from sklearn.metrics import mean_squared_error
 import warnings
 warnings.filterwarnings("ignore")
 
+import random
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(42)
 # ----------------------------
 # 路径配置
 # ----------------------------
@@ -285,3 +297,4 @@ submission = pd.DataFrame({
 })
 submission.to_csv("submission_time_shifted_transformer_no_prior.csv", index=False)
 print("\n Submission saved to submission_time_shifted_transformer_no_prior.csv")
+
