@@ -12,7 +12,7 @@ warnings.filterwarnings("ignore")
 
 import random
 
-def set_seed(seed=42):
+def set_seed(seed=123):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -297,4 +297,5 @@ submission = pd.DataFrame({
 })
 submission.to_csv("submission_time_shifted_transformer_no_prior.csv", index=False)
 print("\n Submission saved to submission_time_shifted_transformer_no_prior.csv")
+
 
