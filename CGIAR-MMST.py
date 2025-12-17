@@ -3,395 +3,265 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error
 import warnings
-
 warnings.filterwarnings("ignore")
-
+----------------------------
+路径配置
+----------------------------
 DATA_DIR = "./data"
-IMG_TRAIN_DIR = os.path.join(DATA_DIR, "Image_arrays_train")
-IMG_TEST_DIR = os.path.join(DATA_DIR, "Image_arrays_test")
+train_file = os.path.join(DATA_DIR, "Train.csv")
+test_file = os.path.join(DATA_DIR, "test_field_ids_with_year.csv")
+aux_file = os.path.join(DATA_DIR, "fields_w_additional_info.csv")
+----------------------------
+定义作物生长季（4月到9月，对应索引3~8）
+----------------------------
+GROWTH_MONTHS = list(range(3, 9))  # 0-based: Apr=3, May=4, ..., Sep=8
+----------------------------
+加载主数据
+----------------------------
+train_df = pd.read_csv(train_file, header=None)
+train_df.columns = ["Field_ID", "Year", "Quality", "Yield"]
+train_df['Yield'] = pd.to_numeric(train_df['Yield'], errors='coerce')
+train_df = train_df.dropna(subset=['Yield']).reset_index(drop=True)
+test_df = pd.read_csv(test_file)
+aux_df = pd.read_csv(aux_file)
+aux_df.set_index("Field_ID", inplace=True)
+----------------------------
+辅助函数：构建结构化气候序列 + 土壤特征（带生长季掩码）
+----------------------------
+def build_features_structured(df, aux_df, growth_months=GROWTH_MONTHS):
+    soil_cols = [col for col in aux_df.columns if col.startswith("soil_")]
+    climate_seq_list = []
+    soil_feat_list = []
+    y_list = []
+var_names = ["aet", "def", "pdsi", "pet", "pr", "ro", "soil", "srad", "swe", "tmmn", "tmmx", "vap", "vpd", "vs"]
 
-
-# ----------------------------
-# 数据加载：新增时间下采样
-# ----------------------------
-
-def load_image(field_id, is_train=True, normalize=True, time_stride=6):
-    """加载图像并进行时间下采样（360 -> 60）"""
-    folder = IMG_TRAIN_DIR if is_train else IMG_TEST_DIR
-    path = os.path.join(folder, f"{field_id}.npy")
-    if not os.path.exists(path):
-        img = np.zeros((360, 41, 41), dtype=np.float32)
-    else:
-        img = np.load(path).astype(np.float32)
+for _, row in df.iterrows():
+    fid = row["Field_ID"]
+    year = int(row["Year"])
     
-    # 时间下采样：每 time_stride 帧取 1 帧
-    img = img[::time_stride]  # (60, 41, 41)
+    if fid in aux_df.index:
+        aux_row = aux_df.loc[fid]
+        soil_feat = aux_row[soil_cols].values.astype(np.float32)
+        
+        # 初始化为 0（非生长季默认无影响）
+        climate_seq = np.zeros((12, len(var_names)), dtype=np.float32)
+        
+        # 仅填充生长季月份
+        for month in growth_months:
+            base = f"climate_{year}_{month+1}_"  # month is 0-based, so +1 for actual month
+            for j, var in enumerate(var_names):
+                col = f"{base}{var}"
+                if col in aux_row.index:
+                    val = aux_row[col]
+                    if isinstance(val, (int, float)) and not pd.isna(val):
+                        climate_seq[month, j] = float(val)
+        climate_seq_list.append(climate_seq)
+        soil_feat_list.append(soil_feat)
+    else:
+        # 若无辅助信息，全为0（包括土壤和气候）
+        climate_seq_list.append(np.zeros((12, len(var_names)), dtype=np.float32))
+        soil_feat_list.append(np.zeros(len(soil_cols), dtype=np.float32))
+    
+    if "Yield" in row:
+        y_list.append(row["Yield"])
 
-    if normalize and img.size > 0:
-        min_val, max_val = img.min(), img.max()
-        if max_val > min_val:
-            img = (img - min_val) / (max_val - min_val)
-        else:
-            img = np.zeros_like(img)
-    return img
+climate_seqs = np.stack(climate_seq_list)  # (N, 12, 14)
+soil_feats = np.stack(soil_feat_list)      # (N, S)
+y = np.array(y_list, dtype=np.float32) if y_list else None
 
+return climate_seqs, soil_feats, y
+----------------------------
+清洗函数
+----------------------------
+def clean_array_3d(X):
+    X = np.where(np.isinf(X), np.nan, X)
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    X = np.clip(X, -1e6, 1e6)
+    return X.astype(np.float32)
+def clean_array_2d(X):
+    X = np.where(np.isinf(X), np.nan, X)
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    X = np.clip(X, -1e6, 1e6)
+    return X.astype(np.float32)
+----------------------------
+构建结构化特征
+----------------------------
+climate_train, soil_train, y_train = build_features_structured(train_df, aux_df)
+climate_test, soil_test, _ = build_features_structured(test_df, aux_df)
+climate_train = clean_array_3d(climate_train)
+climate_test = clean_array_3d(climate_test)
+soil_train = clean_array_2d(soil_train)
+soil_test = clean_array_2d(soil_test)
+y_train = np.nan_to_num(y_train, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+y_train = np.clip(y_train, 0.0, 200.0)
+----------------------------
+标准化
+----------------------------
+N, T, C = climate_train.shape
+S = soil_train.shape[1]
+气候标准化（注意：非生长季为0，标准化后仍接近0）
+climate_train_flat = climate_train.reshape(-1, C)
+climate_scaler = StandardScaler()
+climate_train_scaled_flat = climate_scaler.fit_transform(climate_train_flat)
+climate_train_scaled = climate_train_scaled_flat.reshape(N, T, C)
+climate_test_flat = climate_test.reshape(-1, C)
+climate_test_scaled = climate_scaler.transform(climate_test_flat).reshape(-1, T, C)
+土壤标准化
+soil_scaler = StandardScaler()
+soil_train_scaled = soil_scaler.fit_transform(soil_train)
+soil_test_scaled = soil_scaler.transform(soil_test)
+拼接：每个时间步都包含土壤信息
+soil_train_tiled = np.tile(soil_train_scaled[:, None, :], (1, T, 1))  # (N, 12, S)
+soil_test_tiled = np.tile(soil_test_scaled[:, None, :], (1, T, 1))
+X_train_full = np.concatenate([climate_train_scaled, soil_train_tiled], axis=-1)  # (N, 12, 14+S)
+X_test_full = np.concatenate([climate_test_scaled, soil_test_tiled], axis=-1)
+划分验证集
+X_tr, X_val, y_tr, y_val = train_test_split(
+    X_train_full, y_train, test_size=0.2, random_state=42
+)
+----------------------------
+Dataset
+----------------------------
+class YieldDataset(Dataset):
+    def init(self, X, y=None):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.float32) if y is not None else None
+def __len__(self):
+    return len(self.X)
 
-def get_aux_features(field_id, soil_climate_df):
-    if field_id in soil_climate_df.index:
-        return soil_climate_df.loc[field_id].values.astype(np.float32)
-    return np.zeros(soil_climate_df.shape[1], dtype=np.float32)
-
-
-class MMSTViTDataset(Dataset):
-    def __init__(self, df, soil_climate, is_train=True, aux_scaler=None, time_stride=6):
-        self.df = df.reset_index(drop=True)
-        self.soil_climate = soil_climate
-        self.is_train = is_train
-        self.time_stride = time_stride
-
-        self.images = []
-        self.aux_feats = []
-        self.targets = []
-
-        for _, row in self.df.iterrows():
-            fid = row["Field_ID"]
-            self.images.append(load_image(fid, is_train, time_stride=time_stride))
-            self.aux_feats.append(get_aux_features(fid, soil_climate))
-            if is_train:
-                self.targets.append(row["Yield"])
-
-        self.images = np.stack(self.images)  # Now: (N, 60, 41, 41)
-        self.aux_feats = np.stack(self.aux_feats)
-
-        if aux_scaler is None:
-            self.aux_scaler = StandardScaler()
-            self.aux_feats = self.aux_scaler.fit_transform(self.aux_feats)
-        else:
-            self.aux_feats = aux_scaler.transform(self.aux_feats)
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        img = torch.tensor(self.images[idx])  # (60, 41, 41)
-        aux = torch.tensor(self.aux_feats[idx])
-        if self.is_train:
-            y = torch.tensor(self.targets[idx], dtype=torch.float32)
-            return img, aux, y
-        return img, aux
-
-
-# ----------------------------
-# ViT 组件（保持不变）
-# ----------------------------
-
-class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features)
-        self.drop = nn.Dropout(drop)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
-        return x
-
-
-class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
-        super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-    def forward(self, x):
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
-
-
-class Block(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
-                 norm_layer=nn.LayerNorm):
-        super().__init__()
-        self.norm1 = norm_layer(dim)
-        self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
-        self.norm2 = norm_layer(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=nn.GELU, drop=drop)
-
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-
-# ----------------------------
-# Patch Embedding（带 padding + contiguous）
-# ----------------------------
-
-class PatchEmbed(nn.Module):
-    def __init__(self, img_size=(41, 41), patch_size=7, in_chans=1, embed_dim=768):
-        super().__init__()
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.in_chans = in_chans
-        self.embed_dim = embed_dim
-
-        pad_h = (patch_size - img_size[0] % patch_size) % patch_size
-        pad_w = (patch_size - img_size[1] % patch_size) % patch_size
-        self.pad_h = pad_h
-        self.pad_w = pad_w
-
-        new_h = img_size[0] + pad_h
-        new_w = img_size[1] + pad_w
-        self.grid_size = (new_h // patch_size, new_w // patch_size)
-        self.num_patches = self.grid_size[0] * self.grid_size[1]
-
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
-
-    def forward(self, x):
-        B, T, H, W = x.shape
-        if self.pad_h > 0 or self.pad_w > 0:
-            x = F.pad(x, (0, self.pad_w, 0, self.pad_h), mode='constant', value=0)
-            H += self.pad_h
-            W += self.pad_w
-
-        x = x.view(B * T, self.in_chans, H, W)
-        x = self.proj(x)
-        x = x.flatten(2).transpose(1, 2)
-        x = x.contiguous()
-        x = x.view(B, T, self.num_patches, self.embed_dim)
-        return x
-
-
-# ----------------------------
-# 模型组件（轻量化）
-# ----------------------------
-
-class MultiModalTransformer(nn.Module):
-    def __init__(self, embed_dim=128, depth=2, num_heads=4, mlp_ratio=2., qkv_bias=True, norm_layer=nn.LayerNorm):
-        super().__init__()
-        self.blocks = nn.Sequential(*[
-            Block(embed_dim, num_heads, mlp_ratio, qkv_bias=qkv_bias, norm_layer=norm_layer)
-            for _ in range(depth)
-        ])
-        self.norm = norm_layer(embed_dim)
-
-    def forward(self, x):
-        B, T, N, D = x.shape
-        x = x.contiguous()
-        x = x.view(B, T * N, D)
-        x = self.blocks(x)
-        x = self.norm(x)
-        x = x.contiguous()
-        x = x.view(B, T, N, D)
-        return x
-
-
-class TemporalTransformer(nn.Module):
-    def __init__(self, embed_dim=128, aux_dim=64, depth=2, num_heads=4, mlp_ratio=2., qkv_bias=True,
-                 norm_layer=nn.LayerNorm):
-        super().__init__()
-        self.aux_proj = nn.Linear(aux_dim, embed_dim)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, 2, embed_dim))
-
-        self.blocks = nn.Sequential(*[
-            Block(embed_dim, num_heads, mlp_ratio, qkv_bias=qkv_bias, norm_layer=norm_layer)
-            for _ in range(depth)
-        ])
-        self.norm = norm_layer(embed_dim)
-        self.initialize_weights()
-
-    def initialize_weights(self):
-        torch.nn.init.normal_(self.cls_token, std=.02)
-        torch.nn.init.normal_(self.pos_embed, std=.02)
-
-    def forward(self, x, aux):
-        B, T, D = x.shape
-        aux_proj = self.aux_proj(aux).unsqueeze(1)
-        x = torch.cat([x, aux_proj], dim=1)
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        x = torch.cat([cls_tokens, x], dim=1)
-
-        pos_tokens = torch.zeros_like(x)
-        pos_tokens[:, :2] = self.pos_embed
-        x = x + pos_tokens
-        x = x.contiguous()
-        x = self.blocks(x)
-        x = self.norm(x)
-        return x[:, 0]
-
-
-class SimplifiedMMSTViT(nn.Module):
-    def __init__(self,
-                 img_size=(41, 41),
-                 patch_size=7,
-                 in_chans=1,
-                 num_classes=1,
-                 embed_dim=128,      # ↓ 减小
-                 mm_depth=2,
-                 temp_depth=2,
-                 num_heads=4,        # ↓ 减小
-                 mlp_ratio=2.,       # ↓ 减小
-                 aux_dim=64):
-        super().__init__()
-        self.patch_embed = PatchEmbed(
-            img_size=img_size,
-            patch_size=patch_size,
-            in_chans=in_chans,
-            embed_dim=embed_dim
+def __getitem__(self, idx):
+    if self.y is not None:
+        return self.X[idx], self.y[idx]
+    return self.X[idx]
+----------------------------
+Time-Shifted Transformer 模型
+----------------------------
+class TimeShiftedTransformerYieldPredictor(nn.Module):
+    def init(self, seq_len=12, input_dim=14+20, embed_dim=128, nhead=8, num_layers=2, dropout=0.1):
+        super().init()
+        self.seq_len = seq_len
+        self.embedding = nn.Linear(input_dim, embed_dim)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=nhead, dropout=dropout, batch_first=True
         )
-        self.mm_transformer = MultiModalTransformer(
-            embed_dim=embed_dim,
-            depth=mm_depth,
-            num_heads=num_heads,
-            mlp_ratio=mlp_ratio
-        )
-        self.temporal_transformer = TemporalTransformer(
-            embed_dim=embed_dim,
-            aux_dim=aux_dim,
-            depth=temp_depth,
-            num_heads=num_heads,
-            mlp_ratio=mlp_ratio
-        )
-        self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+    # 可学习滞后权重 αₖ
+    self.lag_weights = nn.Parameter(torch.randn(seq_len))
+    
+    self.regressor = nn.Sequential(
+        nn.Linear(embed_dim, 64),
+        nn.ReLU(),
+        nn.Dropout(dropout),
+        nn.Linear(64, 1)
+    )
 
-    def forward(self, img, aux):
-        x = self.patch_embed(img)           # (B, 60, 36, 128)
-        x = x.contiguous()
-        x = self.mm_transformer(x)          # (B, 60, 36, 128)
-        x = x.mean(dim=2)                   # (B, 60, 128)
-        x = x.contiguous()
-        x = self.temporal_transformer(x, aux)  # (B, 128)
-        x = self.head(x)
-        return x.squeeze(-1)
+    # 因果掩码：上三角为 True 表示屏蔽
+    mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
+    self.register_buffer("causal_mask", mask)
 
+def forward(self, x):
+    # x: (B, L, D)
+    x = self.embedding(x)  # (B, L, E)
+    out = self.transformer(x, mask=self.causal_mask)  # (B, L, E)
+    
+    # 加权聚合时间步
+    weights = torch.softmax(self.lag_weights, dim=0)  # (L,)
+    weighted_repr = (out * weights.unsqueeze(0).unsqueeze(-1)).sum(dim=1)  # (B, E)
+    
+    return self.regressor(weighted_repr).squeeze(-1)
+----------------------------
+训练设置
+----------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+input_dim = X_tr.shape[-1]  # 14 + S
+model = TimeShiftedTransformerYieldPredictor(
+    seq_len=12,
+    input_dim=input_dim,
+    embed_dim=128,
+    nhead=8,
+    num_layers=2,
+    dropout=0.1
+).to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+criterion = nn.MSELoss()
+train_dataset = YieldDataset(X_tr, y_tr)
+val_dataset = YieldDataset(X_val, y_val)
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+----------------------------
+训练循环
+----------------------------
+best_val_rmse = float('inf')
+for epoch in range(50):
+    model.train()
+    for x, y in train_loader:
+        x, y = x.to(device), y.to(device)
+        pred = model(x)
+        loss = criterion(pred, y)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+model.eval()
+val_preds, val_targets = [], []
+with torch.no_grad():
+    for x, y in val_loader:
+        x, y = x.to(device), y.to(device)
+        pred = model(x)
+        val_preds.append(pred.cpu().numpy())
+        val_targets.append(y.cpu().numpy())
 
-# ----------------------------
-# 主函数（使用小 batch）
-# ----------------------------
+val_preds = np.concatenate(val_preds)
+val_targets = np.concatenate(val_targets)
+val_rmse = np.sqrt(mean_squared_error(val_targets, val_preds))
+val_var = np.var(val_targets - val_preds)
 
-def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+if val_rmse < best_val_rmse:
+    best_val_rmse = val_rmse
+    torch.save(model.state_dict(), "best_time_shifted_transformer.pth")
 
-    train_df = pd.read_csv(os.path.join(DATA_DIR, "Train.csv"))
-    train_df['Yield'] = pd.to_numeric(train_df['Yield'], errors='coerce')
-    train_df = train_df.dropna(subset=['Yield']).reset_index(drop=True)
-
-    test_df = pd.read_csv(os.path.join(DATA_DIR, "test_field_ids_with_year.csv"))
-    soil_climate = pd.read_excel(os.path.join(DATA_DIR, "samply.xlsx"), engine='openpyxl')
-    soil_climate.set_index("Field_ID", inplace=True)
-
-    train_meta, val_meta = train_test_split(train_df, test_size=0.2, random_state=42)
-
-    # ⚠️ 关键：time_stride=6 → 360 → 60 frames
-    train_dataset = MMSTViTDataset(train_meta, soil_climate, is_train=True, time_stride=6)
-    val_dataset = MMSTViTDataset(val_meta, soil_climate, is_train=True, aux_scaler=train_dataset.aux_scaler, time_stride=6)
-    test_dataset = MMSTViTDataset(test_df, soil_climate, is_train=False, aux_scaler=train_dataset.aux_scaler, time_stride=6)
-
-    # ⚠️ 关键：batch_size=4
-    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=2, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False, num_workers=2, pin_memory=True)
-
-    aux_dim = train_dataset.aux_feats.shape[1]
-    model = SimplifiedMMSTViT(
-        img_size=(41, 41),
-        patch_size=7,
-        in_chans=1,
-        embed_dim=128,
-        mm_depth=2,
-        temp_depth=2,
-        num_heads=4,
-        mlp_ratio=2.,
-        aux_dim=aux_dim
-    ).to(device)
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=30)
-    criterion = nn.MSELoss()
-
-    best_val_rmse = float('inf')
-    num_epochs = 30
-
-    for epoch in range(num_epochs):
-        model.train()
-        total_loss = 0.0
-        for img, aux, y in train_loader:
-            img, aux, y = img.to(device), aux.to(device), y.to(device)
-            optimizer.zero_grad()
-            pred = model(img, aux)
-            loss = criterion(pred, y)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-
-        scheduler.step()
-
-        model.eval()
-        val_preds, val_targets = [], []
-        with torch.no_grad():
-            for img, aux, y in val_loader:
-                img, aux, y = img.to(device), aux.to(device), y.to(device)
-                pred = model(img, aux)
-                val_preds.extend(pred.cpu().numpy())
-                val_targets.extend(y.cpu().numpy())
-
-        val_mse = np.mean((np.array(val_preds) - np.array(val_targets)) ** 2)
-        val_rmse = np.sqrt(val_mse)
-        avg_train_loss = total_loss / len(train_loader)
-
-        print(f"Epoch [{epoch + 1}/{num_epochs}] | Train Loss: {avg_train_loss:.4f} | Val RMSE: {val_rmse:.4f}")
-
-        if val_rmse < best_val_rmse:
-            best_val_rmse = val_rmse
-            torch.save(model.state_dict(), os.path.join(DATA_DIR, "best_mmst_vit_model.pth"))
-            print(f"New best model saved with Val RMSE: {best_val_rmse:.4f}")
-
-    print("Loading best model for inference...")
-    model.load_state_dict(torch.load(os.path.join(DATA_DIR, "best_mmst_vit_model.pth")))
-    model.eval()
-    final_preds = []
-
-    with torch.no_grad():
-        for img, aux in test_loader:
-            img, aux = img.to(device), aux.to(device)
-            pred = model(img, aux)
-            final_preds.extend(pred.cpu().numpy())
-
-    submission = pd.DataFrame({
-        "Field_ID": test_df["Field_ID"],
-        "Yield": np.clip(final_preds, 0, None)
-    })
-    submission.to_csv(os.path.join(DATA_DIR, "submission_MMST_ViT.csv"), index=False)
-    print("Submission file saved.")
-
-
-if __name__ == "__main__":
-    main()
+print(f"Epoch {epoch+1:2d} | Val RMSE: {val_rmse:.4f} | Residual Variance: {val_var:.4f}")
+----------------------------
+最终评估
+----------------------------
+model.load_state_dict(torch.load("best_time_shifted_transformer.pth", map_location=device))
+model.eval()
+with torch.no_grad():
+    val_preds = []
+    for x, _ in val_loader:
+        x = x.to(device)
+        pred = model(x)
+        val_preds.append(pred.cpu().numpy())
+    val_preds = np.concatenate(val_preds)
+    final_rmse = np.sqrt(mean_squared_error(y_val, val_preds))
+    final_var = np.var(y_val - val_preds)
+print("\n Final Validation Metrics:")
+print(f"RMSE: {final_rmse:.4f}")
+print(f"Residual Variance: {final_var:.4f}")
+打印学习到的滞后权重
+lag_weights = torch.softmax(model.lag_weights, dim=0).detach().cpu().numpy()
+print("\n Learned lag weights (month 1 to 12):")
+for i, w in enumerate(lag_weights, 1):
+    print(f"  Month {i:2d}: {w:.4f}")
+----------------------------
+测试预测 & 提交
+----------------------------
+test_dataset = YieldDataset(X_test_full)
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+with torch.no_grad():
+    test_preds = []
+    for x in test_loader:
+        x = x.to(device)
+        pred = model(x)
+        test_preds.append(pred.cpu().numpy())
+    test_preds = np.concatenate(test_preds)
+submission = pd.DataFrame({
+    "Field_ID": test_df["Field_ID"],
+    "Yield": np.clip(test_preds, 0, None)
+})
+submission.to_csv("submission_time_shifted_transformer_growing_season.csv", index=False)
+print("\n Submission saved to submission_time_shifted_transformer_growing_season.csv")
