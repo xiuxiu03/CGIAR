@@ -181,29 +181,35 @@ class TimeShiftedFeatureExtractor(nn.Module):
         return weighted_repr
 
 # ----------------------------
-# LLM 回归头（LoRA 微调）
+# LLM 回归头（使用本地 Qwen2-0.5B-Instruct）
 # ----------------------------
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model
 
 class LLMRegressor(nn.Module):
-    def __init__(self, feature_dim=128, llm_name="Qwen/Qwen-1.8B-Chat"):
+    def __init__(self, feature_dim=128, llm_local_path="/mnt/data/zhongfangxiu/CGIAR/Qwen2-0.5B-Instruct"):
         super().__init__()
-        print(f"Loading LLM: {llm_name}")
-        self.tokenizer = AutoTokenizer.from_pretrained(llm_name, trust_remote_code=True)
+        print(f"✅ Loading Qwen2-0.5B-Instruct from: {llm_local_path}")
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            llm_local_path,
+            trust_remote_code=True,
+            use_fast=False
+        )
         self.llm = AutoModelForCausalLM.from_pretrained(
-            llm_name,
+            llm_local_path,
             trust_remote_code=True,
             torch_dtype=torch.float16,
             device_map="auto"
         )
+        # 冻结所有原始参数
         for param in self.llm.parameters():
             param.requires_grad = False
 
+        # Qwen2 的注意力层模块名（经验证）
         lora_config = LoraConfig(
             r=8,
             lora_alpha=16,
-            target_modules=["q_proj", "v_proj"],
+            target_modules=["q_proj", "v_proj"],  # Qwen2 兼容此设置
             lora_dropout=0.1,
             bias="none",
             task_type="CAUSAL_LM"
@@ -211,13 +217,14 @@ class LLMRegressor(nn.Module):
         self.llm = get_peft_model(self.llm, lora_config)
         self.llm.print_trainable_parameters()
 
+        # 投影 + 回归头
         self.proj = nn.Linear(feature_dim, self.llm.config.hidden_size)
         self.regressor = nn.Linear(self.llm.config.hidden_size, 1)
 
     def forward(self, features):
         prompt_embeds = self.proj(features).unsqueeze(1)  # (B, 1, hidden_size)
         outputs = self.llm(inputs_embeds=prompt_embeds, output_hidden_states=True)
-        last_hidden = outputs.hidden_states[-1][:, -1, :]
+        last_hidden = outputs.hidden_states[-1][:, -1, :]  # (B, hidden_size)
         return self.regressor(last_hidden).squeeze(-1)
 
 # ----------------------------
@@ -237,7 +244,7 @@ class YieldPredictorWithLLM(nn.Module):
 # 训练设置
 # ----------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-input_dim = X_tr.shape[-1]  # 应为 14 + S（如 34）
+input_dim = X_tr.shape[-1]
 
 feature_extractor = TimeShiftedFeatureExtractor(
     seq_len=12,
@@ -248,11 +255,11 @@ feature_extractor = TimeShiftedFeatureExtractor(
     dropout=0.1
 )
 
-llm_regressor = LLMRegressor(feature_dim=128, llm_name="Qwen/Qwen-1.8B-Chat")
+llm_regressor = LLMRegressor(feature_dim=128)
 
 model = YieldPredictorWithLLM(feature_extractor, llm_regressor).to(device)
 
-# 只优化 LLM 回归头中的可训练参数
+# 只优化 LLM 回归头中的可训练参数（LoRA + proj + regressor）
 optimizer = torch.optim.AdamW(
     model.llm_regressor.parameters(),
     lr=1e-4,
@@ -262,7 +269,7 @@ criterion = nn.MSELoss()
 
 train_dataset = YieldDataset(X_tr, y_tr)
 val_dataset = YieldDataset(X_val, y_val)
-train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)   # 减小 batch size
+train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
 
 # ----------------------------
@@ -339,5 +346,5 @@ submission = pd.DataFrame({
     "Field_ID": test_df["Field_ID"],
     "Yield": np.clip(test_preds, 0, None)
 })
-submission.to_csv("submission_llm_lora.csv", index=False)
-print("\n Submission saved to submission_llm_lora.csv")
+submission.to_csv("submission_qwen2_lora.csv", index=False)
+print("\n Submission saved to submission_qwen2_lora.csv")
