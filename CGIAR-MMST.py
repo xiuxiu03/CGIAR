@@ -34,7 +34,7 @@ aux_file = os.path.join(DATA_DIR, "fields_w_additional_info.csv")
 # ----------------------------
 # 定义作物生长季（4月到9月，对应索引3～8）
 # ----------------------------
-GROWTH_MONTHS = list(range(3, 9))  # 0-based: Apr=3, May=4, ..., Sep=8
+GROWTH_MONTHS = list(range(3, 9))  # Apr=3, ..., Sep=8 (0-based)
 
 # ----------------------------
 # 加载主数据
@@ -48,7 +48,7 @@ aux_df = pd.read_csv(aux_file)
 aux_df.set_index("Field_ID", inplace=True)
 
 # ----------------------------
-# 辅助函数：构建结构化气候序列 + 土壤特征（带生长季掩码）
+# 辅助函数：构建结构化气候序列 + 土壤特征
 # ----------------------------
 def build_features_structured(df, aux_df, growth_months=GROWTH_MONTHS):
     soil_cols = [col for col in aux_df.columns if col.startswith("soil_")]
@@ -63,9 +63,7 @@ def build_features_structured(df, aux_df, growth_months=GROWTH_MONTHS):
         if fid in aux_df.index:
             aux_row = aux_df.loc[fid]
             soil_feat = aux_row[soil_cols].values.astype(np.float32)
-            
             climate_seq = np.zeros((12, len(var_names)), dtype=np.float32)
-            
             for month in growth_months:
                 base = f"climate_{year}_{month+1}_"
                 for j, var in enumerate(var_names):
@@ -104,7 +102,7 @@ def clean_array_2d(X):
     return X.astype(np.float32)
 
 # ----------------------------
-# 构建结构化特征
+# 构建特征
 # ----------------------------
 climate_train, soil_train, y_train = build_features_structured(train_df, aux_df)
 climate_test, soil_test, _ = build_features_structured(test_df, aux_df)
@@ -158,7 +156,7 @@ class YieldDataset(Dataset):
         return self.X[idx]
 
 # ----------------------------
-# 特征提取器（原 Time-Shifted Transformer 去掉 regressor）
+# Time-Shifted Feature Extractor
 # ----------------------------
 class TimeShiftedFeatureExtractor(nn.Module):
     def __init__(self, seq_len=12, input_dim=34, embed_dim=128, nhead=8, num_layers=2, dropout=0.1):
@@ -181,29 +179,42 @@ class TimeShiftedFeatureExtractor(nn.Module):
         return weighted_repr
 
 # ----------------------------
-# LLM 回归头（LoRA 微调）
+# LLM 回归头（使用本地 Qwen-1.8B-Chat）
 # ----------------------------
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model
 
+LOCAL_LLM_PATH = "/home/zhongfangxiu/.cache/modelscope/hub/models/qwen/Qwen-1_8B-Chat"
+
 class LLMRegressor(nn.Module):
-    def __init__(self, feature_dim=128, llm_name="Qwen/Qwen-1.8B-Chat"):
+    def __init__(self, feature_dim=128, llm_local_path=LOCAL_LLM_PATH):
         super().__init__()
-        print(f"Loading LLM: {llm_name}")
-        self.tokenizer = AutoTokenizer.from_pretrained(llm_name, trust_remote_code=True)
+        print(f"✅ Loading Qwen-1.8B-Chat from local path: {llm_local_path}")
+        
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            llm_local_path,
+            trust_remote_code=True,
+            use_fast=False,           # Qwen 不支持 fast tokenizer
+            local_files_only=True     # 禁止联网
+        )
+        
         self.llm = AutoModelForCausalLM.from_pretrained(
-            llm_name,
+            llm_local_path,
             trust_remote_code=True,
             torch_dtype=torch.float16,
-            device_map="auto"
+            device_map="auto",
+            local_files_only=True     # 关键：仅使用本地文件
         )
+        
+        # 冻结原始参数
         for param in self.llm.parameters():
             param.requires_grad = False
 
+        # ⚠️ Qwen-1.8B 是 Qwen1 架构，attention 层名为 "c_attn"
         lora_config = LoraConfig(
             r=8,
             lora_alpha=16,
-            target_modules=["q_proj", "v_proj"],
+            target_modules=["c_attn"],   # ← 正确模块名（不是 q_proj/v_proj！）
             lora_dropout=0.1,
             bias="none",
             task_type="CAUSAL_LM"
@@ -237,7 +248,7 @@ class YieldPredictorWithLLM(nn.Module):
 # 训练设置
 # ----------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-input_dim = X_tr.shape[-1]  # 应为 14 + S（如 34）
+input_dim = X_tr.shape[-1]
 
 feature_extractor = TimeShiftedFeatureExtractor(
     seq_len=12,
@@ -248,11 +259,11 @@ feature_extractor = TimeShiftedFeatureExtractor(
     dropout=0.1
 )
 
-llm_regressor = LLMRegressor(feature_dim=128, llm_name="Qwen/Qwen-1.8B-Chat")
+llm_regressor = LLMRegressor(feature_dim=128)
 
 model = YieldPredictorWithLLM(feature_extractor, llm_regressor).to(device)
 
-# 只优化 LLM 回归头中的可训练参数
+# 只优化 LLM 回归头中的可训练参数（LoRA + proj + regressor）
 optimizer = torch.optim.AdamW(
     model.llm_regressor.parameters(),
     lr=1e-4,
@@ -262,7 +273,7 @@ criterion = nn.MSELoss()
 
 train_dataset = YieldDataset(X_tr, y_tr)
 val_dataset = YieldDataset(X_val, y_val)
-train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)   # 减小 batch size
+train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
 
 # ----------------------------
