@@ -21,7 +21,7 @@ except ImportError:
     raise ImportError("请安装依赖: pip install dashscope tiktoken")
 
 # 🔑 替换为你的阿里云 API Key
-dashscope.api_key = "sk-de23b38af1c24284a8508abfff518d91"
+dashscope.api_key = "sk-65aa3b4c924b43e29bbffe9430eeb010"
 
 def split_text_into_chunks(text: str, max_tokens: int = 2000) -> list[str]:
     encoding = tiktoken.get_encoding("cl100k_base")
@@ -377,3 +377,4 @@ submission = pd.DataFrame({
 })
 submission.to_csv("submission_fused_time_shifted_with_prompt_context.csv", index=False)
 print("\n✅ Submission saved to submission_fused_time_shifted_with_prompt_context.csv")
+
