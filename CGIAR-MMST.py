@@ -92,32 +92,6 @@ tmmx（Mean Maximum Temperature）：月平均最高气温，反映白天或暖�
 vap（Vapor Pressure）：水汽压，表示空气中水汽的分压力，与湿度密切相关。
 vpd（Vapor Pressure Deficit）：饱和水汽压差，表征大气干燥程度，影响植物蒸腾和水分胁迫。
 vs（Wind Speed）：风速，影响蒸发、传热、花粉传播及风蚀过程。
-数据集来自2016到2019年各月指标的平均值数据如下所示：
-土壤属性（全年各月相同）：
-1月到12月，soil_bulk_density的数据平均值为118.16；
-1月到12月，soil_cec的数据平均值为198.16；
-1月到12月，soil_coarse_fragments的数据平均值为100.51；
-1月到12月，soil_clay的数据平均值为439.36；
-1月到12月，soil_nitrogen的数据平均值为1551.76；
-1月到12月，soil_organic_carbon_density的数据平均值为309.32；
-1月到12月，soil_organic_carbon_stock的数据平均值为60.48；
-1月到12月，soil_ph的数据平均值为56.38；
-1月到12月，soil_sand的数据平均值为290.39；
-1月到12月，soil_silt的数据平均值为270.24；
-1月到12月，soil_organic_carbon的数据平均值为277.47。
-气候与水文变量（按月变化）：
-1月，aet的数据平均值为709.31，def为821.39，pdsi为87.32，pet为1530.70，pr为51.59，ro为2.73，soil_moisture为406.91，srad为2397.36，swe为0.00，tmmn为138.99，tmmx为299.61，vap为1589.05，vpd为148.21，vs为281.25。
-2月，aet的数据平均值为818.25，def为703.06，pdsi为50.12，pet为1521.31，pr为77.07，ro为4.22，soil_moisture为317.30，srad为2571.08，swe为0.00，tmmn为142.50，tmmx为309.78，vap为1597.10，vpd为170.36，vs为309.84。
-3月，aet的数据平均值为805.04，def为794.31，pdsi为-62.40，pet为1599.35，pr为83.46，ro为5.32，soil_moisture为293.79，srad为2507.42，swe为0.00，tmmn为145.07，tmmx为303.15，vap为1696.47，vpd为128.15，vs为287.17。
-4月，aet的数据平均值为1180.50，def为67.02，pdsi为-122.93，pet为1247.52，pr为222.01，ro为65.30，soil_moisture为680.48，srad为2122.03，swe为0.00，tmmn为146.25，tmmx为286.70，vap为1849.33，vpd为94.79，vs为242.62。
-5月，aet的数据平均值为1057.46，def为118.09，pdsi为-206.88，pet为1175.55，pr为179.82，ro为73.74，soil_moisture为683.89，srad为2107.82，swe为0.00，tmmn为139.14，tmmx为275.62，vap为1890.26，vpd为74.02，vs为217.24。
-6月，aet的数据平均值为763.88，def为360.84，pdsi为-232.32，pet为1124.73，pr为116.14，ro为54.56，soil_moisture为535.77，srad为2079.13，swe为0.00，tmmn为136.06，tmmx为275.33，vap为1795.43，vpd为87.32，vs为210.62。
-7月，aet的数据平均值为574.95，def为587.48，pdsi为-323.84，pet为1162.43，pr为47.76，ro为2.83，soil_moisture为410.17，srad为2038.99，swe为0.00，tmmn为132.57，tmmx为272.36，vap为1710.61，vpd为91.77，vs为217.68。
-8月，aet的数据平均值为820.22，def为393.83，pdsi为-377.14，pet为1214.05，pr为106.67，ro为25.26，soil_moisture为404.07，srad为2082.24，swe为0.00，tmmn为132.43，tmmx为275.52，vap为1717.87，vpd为96.49，vs为226.64。
-9月，aet的数据平均值为943.88，def为332.42，pdsi为-394.34，pet为1276.30，pr为101.63，ro为10.24，soil_moisture为374.13，srad为2251.89，swe为0.00，tmmn为131.14，tmmx为284.16，vap为1743.16，vpd为104.33，vs为232.52。
-10月，aet的数据平均值为1007.66，def为314.03，pdsi为-376.38，pet为1321.69，pr为130.08，ro为16.83，soil_moisture为498.86，srad为2182.70，swe为0.00，tmmn为137.83，tmmx为289.01，vap为1775.30，vpd为102.19，vs为234.37。
-11月，aet的数据平均值为1108.34，def为172.47，pdsi为-380.39，pet为1280.80，pr为109.77，ro为8.87，soil_moisture为399.33，srad为2197.84，swe为0.00，tmmn为138.36，tmmx为291.27，vap为1801.88，vpd为109.34，vs为244.52。
-12月，aet的数据平均值为770.90，def为633.86，pdsi为-370.28，pet为1404.74，pr为97.48，ro为11.08，soil_moisture为492.59，srad为2254.79，swe为0.00，tmmn为139.68，tmmx为292.40，vap为1683.09，vpd为118.73，vs为264.37。
 """
 
 print("🚀 正在处理完整 prompt 的嵌入...")
@@ -377,4 +351,5 @@ submission = pd.DataFrame({
 })
 submission.to_csv("submission_fused_time_shifted_with_prompt_context.csv", index=False)
 print("\n✅ Submission saved to submission_fused_time_shifted_with_prompt_context.csv")
+
 
