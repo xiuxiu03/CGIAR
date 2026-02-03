@@ -7,11 +7,9 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error
-from sklearn.decomposition import PCA
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
-import seaborn as sns
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -103,18 +101,17 @@ for cid in range(n_clusters):
     print(f"  Cluster {cid}: {', '.join(members)}")
 
 # ----------------------------
-# 2. 构建全局 prompt 嵌入（仅语义，无数据）
+# 2. 构建全局 prompt 嵌入（仅语义，无数据）→ 直接使用 1536 维
 # ----------------------------
 prompt_text = """
 你是一个气候与土壤数据分析助手。以下是东非地区预测玉米产量时常用的土壤属性与气象指标说明：
 """ + "\n".join([f"{k}：{v}" for k, v in variable_descriptions.items()])
 
-global_embedding_full = get_single_embedding(prompt_text)  # 整体语义向量
+global_embedding_full = get_single_embedding(prompt_text)  # shape: (1536,)
 
-# 降维至 32 维（减少噪声，防止过拟合）
-pca = PCA(n_components=32, random_state=42)
-global_embedding = pca.fit_transform(global_embedding_full.reshape(1, -1)).flatten()
-print(f"\n✅ 全局嵌入已降维至 {global_embedding.shape[0]} 维")
+# ✅ 修复：不再使用 PCA（单样本无法降维）
+global_embedding = global_embedding_full  # 直接使用原始嵌入
+print(f"\n✅ 使用原始全局嵌入，维度: {global_embedding.shape[0]}")
 
 # ----------------------------
 # 3. 数据加载与预处理（支持消融开关）
@@ -268,7 +265,7 @@ class YieldDataset(Dataset):
         return (self.X_seq[i], self.X_global[i])
 
 class TimeShiftedTransformerWithGlobal(nn.Module):
-    def __init__(self, seq_len=12, input_dim=34, embed_dim=128, global_dim=32, nhead=8, num_layers=2, dropout=0.1):
+    def __init__(self, seq_len=12, input_dim=34, embed_dim=128, global_dim=1536, nhead=8, num_layers=2, dropout=0.1):
         super().__init__()
         self.seq_len = seq_len
         self.embedding = nn.Linear(input_dim, embed_dim)
@@ -277,6 +274,7 @@ class TimeShiftedTransformerWithGlobal(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.global_proj = nn.Linear(global_dim, embed_dim)
+        self.dropout_global = nn.Dropout(dropout)  # ← 新增：防止过拟合
         self.lag_weights = nn.Parameter(torch.randn(seq_len))
         self.regressor = nn.Sequential(
             nn.Linear(embed_dim * 2, 64),
@@ -293,6 +291,7 @@ class TimeShiftedTransformerWithGlobal(nn.Module):
         weights = torch.softmax(self.lag_weights, dim=0)
         seq_repr = (out * weights.unsqueeze(0).unsqueeze(-1)).sum(dim=1)
         global_repr = self.global_proj(x_global)
+        global_repr = self.dropout_global(global_repr)  # ← 应用 dropout
         fused = torch.cat([seq_repr, global_repr], dim=-1)
         return self.regressor(fused).squeeze(-1)
 
@@ -398,4 +397,3 @@ submission = pd.DataFrame({
 output_file = f"submission{suffix}.csv"
 submission.to_csv(output_file, index=False)
 print(f"\n✅ Submission saved to {output_file}")
-
