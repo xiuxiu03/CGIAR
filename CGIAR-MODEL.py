@@ -19,14 +19,12 @@ warnings.filterwarnings("ignore")
 try:
     import dashscope
     from dashscope import TextEmbedding
-    import tiktoken
 except ImportError:
-    raise ImportError("请安装依赖: pip install dashscope tiktoken")
+    raise ImportError("请安装依赖: pip install dashscope")
 
 dashscope.api_key = "sk-65aa3b4c924b43e29bbffe9430eeb010"  # ← 替换为你的 Key
 
 def get_single_embedding(text: str, model: str = "text-embedding-v2") -> np.ndarray:
-    """获取单句嵌入（无需分块）"""
     response = TextEmbedding.call(model=model, input=text.strip())
     if response.status_code != 200:
         raise RuntimeError(f"Embedding failed: {response}")
@@ -34,7 +32,7 @@ def get_single_embedding(text: str, model: str = "text-embedding-v2") -> np.ndar
     return emb
 
 # ----------------------------
-# 1. 变量级嵌入生成与聚类验证
+# 1. 变量描述与预计算变量级嵌入
 # ----------------------------
 variable_descriptions = {
     "soil_bulk_density": "土壤容重，反映土壤紧实程度，影响根系生长和水分渗透。",
@@ -64,77 +62,23 @@ variable_descriptions = {
     "vs": "风速，影响蒸发、传热、花粉传播及风蚀过程。"
 }
 
-print("🔍 正在为每个变量生成嵌入...")
+print("🔍 预计算变量级嵌入...")
 var_embeddings = {}
 for var, desc in variable_descriptions.items():
     full_text = f"{var}: {desc}"
     emb = get_single_embedding(full_text)
     var_embeddings[var] = emb
-
-var_names = list(var_embeddings.keys())
-X_var = np.stack([var_embeddings[name] for name in var_names])  # (25, 1536)
-
-# 聚类验证
-print("\n📊 正在进行聚类分析...")
-X_scaled = StandardScaler().fit_transform(X_var)
-n_clusters = 4
-cluster_labels = AgglomerativeClustering(n_clusters=n_clusters).fit_predict(X_scaled)
-
-# TSNE 可视化
-tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(var_names)-1))
-X_tsne = tsne.fit_transform(X_scaled)
-
-plt.figure(figsize=(12, 8))
-scatter = plt.scatter(X_tsne[:, 0], X_tsne[:, 1], c=cluster_labels, cmap='tab10', s=120, edgecolor='k')
-plt.colorbar(scatter)
-for i, name in enumerate(var_names):
-    plt.text(X_tsne[i, 0] + 0.8, X_tsne[i, 1] + 0.8, name, fontsize=9)
-plt.title("变量嵌入聚类 (TSNE + 层次聚类)", fontsize=14)
-plt.tight_layout()
-plt.savefig("variable_embedding_clusters.png", dpi=150)
-plt.close()
-
-# 打印聚类结果
-print("\n✅ 聚类结果:")
-for cid in range(n_clusters):
-    members = [var_names[i] for i, label in enumerate(cluster_labels) if label == cid]
-    print(f"  Cluster {cid}: {', '.join(members)}")
+print(f"✅ 已生成 {len(var_embeddings)} 个变量嵌入")
 
 # ----------------------------
-# 2. 构建全局 prompt 嵌入（仅语义，无数据）→ 直接使用 1536 维
+# 2. 数据加载
 # ----------------------------
-prompt_text = """
-你是一个气候与土壤数据分析助手。以下是东非地区预测玉米产量时常用的土壤属性与气象指标说明：
-""" + "\n".join([f"{k}：{v}" for k, v in variable_descriptions.items()])
-
-global_embedding_full = get_single_embedding(prompt_text)  # shape: (1536,)
-
-# ✅ 修复：不再使用 PCA（单样本无法降维）
-global_embedding = global_embedding_full  # 直接使用原始嵌入
-print(f"\n✅ 使用原始全局嵌入，维度: {global_embedding.shape[0]}")
-
-# ----------------------------
-# 3. 数据加载与预处理（支持消融开关）
-# ----------------------------
-USE_GLOBAL_CONTEXT = True  # ← 设置为 False 即可关闭嵌入（消融实验）
-
-def set_seed(seed=42):
-    import random
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-set_seed(42)
-
 DATA_DIR = "./data"
 train_file = os.path.join(DATA_DIR, "Train.csv")
 test_file = os.path.join(DATA_DIR, "test_field_ids_with_year.csv")
 aux_file = os.path.join(DATA_DIR, "fields_w_additional_info.csv")
 
-GROWTH_MONTHS = list(range(3, 9))  # Apr=3 to Sep=8 (0-based index)
+GROWTH_MONTHS = list(range(3, 9))  # Apr=3 to Sep=8 (0-based)
 
 train_df = pd.read_csv(train_file, header=None)
 train_df.columns = ["Field_ID", "Year", "Quality", "Yield"]
@@ -144,96 +88,213 @@ test_df = pd.read_csv(test_file)
 aux_df = pd.read_csv(aux_file)
 aux_df.set_index("Field_ID", inplace=True)
 
-def build_features(df, aux_df, global_embedding=None, use_global=True, growth_months=GROWTH_MONTHS):
-    soil_cols = [col for col in aux_df.columns if col.startswith("soil_")]
-    var_names = ["aet", "def", "pdsi", "pet", "pr", "ro", "soil", "srad", "swe", "tmmn", "tmmx", "vap", "vpd", "vs"]
-    
-    climate_seq_list = []
-    soil_feat_list = []
-    y_list = []
+CLIMATE_VARS = ["aet", "def", "pdsi", "pet", "pr", "ro", "soil", "srad", "swe", "tmmn", "tmmx", "vap", "vpd", "vs"]
+SOIL_COLS = [col for col in aux_df.columns if col.startswith("soil_")]
 
+# ----------------------------
+# 3. 为每个训练样本生成语义 embedding（核心新增）
+# ----------------------------
+def compute_sample_embedding(climate_seq, soil_feat, climate_vars, soil_cols, var_emb_dict):
+    """
+    基于样本实际值，加权聚合变量嵌入，生成样本级语义向量。
+    """
+    climate_mean = np.nanmean(climate_seq[GROWTH_MONTHS], axis=0)  # (14,)
+    all_vals = np.concatenate([climate_mean, soil_feat])  # (14 + S,)
+    all_names = climate_vars + soil_cols
+
+    embeds, weights = [], []
+    for val, name in zip(all_vals, all_names):
+        if np.isnan(val) or np.isinf(val):
+            continue
+        # 映射名称到 var_embeddings 的 key
+        key = name if name in var_emb_dict else None
+        if key is None and name.startswith("soil_"):
+            key = name  # 土壤变量名直接匹配
+        if key in var_emb_dict:
+            embeds.append(var_emb_dict[key])
+            weights.append(abs(val) + 1e-6)  # 避免除零
+
+    if not embeds:
+        return np.zeros_like(next(iter(var_emb_dict.values())))
+    
+    embeds = np.stack(embeds)
+    weights = np.array(weights)
+    weights = weights / weights.sum()
+    return (weights[:, None] * embeds).sum(axis=0)
+
+print("\n🧬 正在为每个训练样本生成语义 embedding...")
+sample_embs, valid_y, valid_soil, valid_climate, valid_indices = [], [], [], [], []
+
+for i, row in train_df.iterrows():
+    fid, year = row["Field_ID"], int(row["Year"])
+    if fid not in aux_df.index:
+        continue
+    aux_row = aux_df.loc[fid]
+    
+    # 提取土壤
+    soil_feat = aux_row[SOIL_COLS].values.astype(np.float32)
+    
+    # 提取气候序列
+    climate_seq = np.full((12, len(CLIMATE_VARS)), np.nan, dtype=np.float32)
+    for month in range(12):
+        for j, var in enumerate(CLIMATE_VARS):
+            col = f"climate_{year}_{month+1}_{var}"
+            if col in aux_row.index and pd.notna(aux_row[col]):
+                climate_seq[month, j] = float(aux_row[col])
+    
+    # 生成 embedding
+    emb = compute_sample_embedding(climate_seq, soil_feat, CLIMATE_VARS, SOIL_COLS, var_embeddings)
+    sample_embs.append(emb)
+    valid_y.append(row["Yield"])
+    valid_soil.append(soil_feat)
+    valid_climate.append(climate_seq)
+    valid_indices.append(i)
+
+sample_embs = np.stack(sample_embs)  # (N, 1536)
+valid_y = np.array(valid_y, dtype=np.float32)
+valid_soil = np.stack(valid_soil)
+valid_climate = np.stack(valid_climate)
+valid_climate_mean = np.nanmean(valid_climate[:, GROWTH_MONTHS, :], axis=1)  # (N, 14)
+
+print(f"✅ 成功生成 {len(sample_embs)} 个样本 embedding")
+
+# ----------------------------
+# 4. 聚类与内部一致性验证
+# ----------------------------
+print("\n📊 对样本 embedding 进行聚类...")
+scaler = StandardScaler()
+sample_embs_scaled = scaler.fit_transform(sample_embs)
+n_clusters = 5
+cluster_labels = AgglomerativeClustering(n_clusters=n_clusters, linkage='ward').fit_predict(sample_embs_scaled)
+
+# TSNE 可视化
+tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(sample_embs)-1))
+X_tsne = tsne.fit_transform(sample_embs_scaled)
+plt.figure(figsize=(10, 7))
+scatter = plt.scatter(X_tsne[:, 0], X_tsne[:, 1], c=cluster_labels, cmap='tab10', alpha=0.7)
+plt.colorbar(scatter)
+plt.title("样本级 Embedding 聚类 (TSNE)")
+plt.tight_layout()
+plt.savefig("sample_embedding_clusters.png", dpi=150)
+plt.close()
+
+# 内部一致性分析
+print("\n🔍 聚类内部一致性分析:")
+global_yield_var = np.var(valid_y)
+global_soil_var = np.mean(np.nanvar(valid_soil, axis=0))
+global_climate_var = np.mean(np.nanvar(valid_climate_mean, axis=0))
+
+intra_vars = []
+for cid in range(n_clusters):
+    mask = cluster_labels == cid
+    n = mask.sum()
+    if n == 0:
+        continue
+    y_cluster = valid_y[mask]
+    soil_cluster = valid_soil[mask]
+    climate_cluster = valid_climate_mean[mask]
+    
+    yield_var = np.var(y_cluster)
+    soil_pairwise = np.mean([
+        np.linalg.norm(soil_cluster[i] - soil_cluster[j])
+        for i in range(n) for j in range(i+1, n)
+    ]) if n > 1 else 0.0
+    climate_pairwise = np.mean([
+        np.linalg.norm(climate_cluster[i] - climate_cluster[j])
+        for i in range(n) for j in range(i+1, n)
+    ]) if n > 1 else 0.0
+    
+    intra_vars.append(yield_var)
+    print(f"Cluster {cid} (n={n:3d}): Yield Var={yield_var:.2f}, Soil L2={soil_pairwise:.3f}, Climate L2={climate_pairwise:.3f}")
+
+avg_intra_yield_var = np.mean(intra_vars)
+print(f"\n🌍 全局参考: Yield Var={global_yield_var:.2f}")
+print(f"📌 平均簇内 Yield 方差: {avg_intra_yield_var:.2f}")
+
+if avg_intra_yield_var < global_yield_var * 0.7:
+    print("\n✅ 结论：样本 embedding 聚类有效！簇内样本在产量、土壤、气候上更相似。")
+    EMBEDDING_IS_VALID = True
+else:
+    print("\n⚠️ 结论：聚类效果不显著，embedding 可能未捕获有效语义。")
+    EMBEDDING_IS_VALID = False
+
+# ----------------------------
+# 5. 构建全局 prompt embedding（用于模型）
+# ----------------------------
+prompt_text = "东非玉米产量预测相关变量：" + "；".join(
+    [f"{k}表示{k_desc}" for k, k_desc in variable_descriptions.items()]
+)
+global_embedding_full = get_single_embedding(prompt_text)
+global_embedding = global_embedding_full  # 不再 PCA
+print(f"\n✅ 全局 prompt embedding 维度: {global_embedding.shape[0]}")
+
+# ----------------------------
+# 6. 特征构建（支持消融）
+# ----------------------------
+USE_GLOBAL_CONTEXT = True  # ← 控制是否注入 embedding
+
+def set_seed(seed=42):
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+
+set_seed(42)
+
+def clean_array(X):
+    X = np.where(np.isinf(X), np.nan, X)
+    X = np.nan_to_num(X, nan=0.0)
+    return np.clip(X, -1e6, 1e6).astype(np.float32)
+
+def build_features(df, aux_df, global_emb=None, use_global=True):
+    climate_list, soil_list, y_list = [], [], []
     for _, row in df.iterrows():
-        fid = row["Field_ID"]
-        year = int(row["Year"])
-        
+        fid, year = row["Field_ID"], int(row["Year"])
         if fid in aux_df.index:
             aux_row = aux_df.loc[fid]
-            soil_feat = aux_row[soil_cols].values.astype(np.float32)
-            climate_seq = np.zeros((12, len(var_names)), dtype=np.float32)
-            for month in growth_months:
-                base = f"climate_{year}_{month+1}_"
-                for j, var in enumerate(var_names):
-                    col = f"{base}{var}"
-                    if col in aux_row.index:
-                        val = aux_row[col]
-                        if isinstance(val, (int, float)) and not pd.isna(val):
-                            climate_seq[month, j] = float(val)
-            climate_seq_list.append(climate_seq)
-            soil_feat_list.append(soil_feat)
+            soil_feat = aux_row[SOIL_COLS].values.astype(np.float32)
+            climate_seq = np.zeros((12, len(CLIMATE_VARS)), dtype=np.float32)
+            for month in GROWTH_MONTHS:
+                for j, var in enumerate(CLIMATE_VARS):
+                    col = f"climate_{year}_{month+1}_{var}"
+                    if col in aux_row.index and pd.notna(aux_row[col]):
+                        climate_seq[month, j] = float(aux_row[col])
+            climate_list.append(climate_seq)
+            soil_list.append(soil_feat)
         else:
-            climate_seq_list.append(np.zeros((12, len(var_names)), dtype=np.float32))
-            soil_feat_list.append(np.zeros(len(soil_cols), dtype=np.float32))
-
+            climate_list.append(np.zeros((12, len(CLIMATE_VARS)), dtype=np.float32))
+            soil_list.append(np.zeros(len(SOIL_COLS), dtype=np.float32))
         if "Yield" in row:
             y_list.append(row["Yield"])
-
-    climate_seqs = np.stack(climate_seq_list)
-    soil_feats = np.stack(soil_feat_list)
+    climate = clean_array(np.stack(climate_list))
+    soil = clean_array(np.stack(soil_list))
     y = np.array(y_list, dtype=np.float32) if y_list else None
-
-    N = climate_seqs.shape[0]
-    if use_global and global_embedding is not None:
-        X_global = np.tile(global_embedding, (N, 1)).astype(np.float32)
+    N = climate.shape[0]
+    if use_global and global_emb is not None:
+        X_global = np.tile(global_emb, (N, 1)).astype(np.float32)
     else:
-        X_global = np.zeros((N, 1), dtype=np.float32)  # 消融：无嵌入
-
-    return climate_seqs, soil_feats, X_global, y
-
-def clean_array_3d(X):
-    X = np.where(np.isinf(X), np.nan, X)
-    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-    X = np.clip(X, -1e6, 1e6)
-    return X.astype(np.float32)
-
-def clean_array_2d(X):
-    X = np.where(np.isinf(X), np.nan, X)
-    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-    X = np.clip(X, -1e6, 1e6)
-    return X.astype(np.float32)
+        X_global = np.zeros((N, 1), dtype=np.float32)
+    return climate, soil, X_global, y
 
 # 构建特征
 if USE_GLOBAL_CONTEXT:
-    climate_train, soil_train, X_global_train, y_train = build_features(
-        train_df, aux_df, global_embedding, use_global=True
-    )
-    climate_test, soil_test, X_global_test, _ = build_features(
-        test_df, aux_df, global_embedding, use_global=True
-    )
+    climate_train, soil_train, X_global_train, y_train = build_features(train_df, aux_df, global_embedding, True)
+    climate_test, soil_test, X_global_test, _ = build_features(test_df, aux_df, global_embedding, True)
 else:
-    climate_train, soil_train, X_global_train, y_train = build_features(
-        train_df, aux_df, use_global=False
-    )
-    climate_test, soil_test, X_global_test, _ = build_features(
-        test_df, aux_df, use_global=False
-    )
+    climate_train, soil_train, X_global_train, y_train = build_features(train_df, aux_df, use_global=False)
+    climate_test, soil_test, X_global_test, _ = build_features(test_df, aux_df, use_global=False)
 
-# 清洗 & 标准化
-climate_train = clean_array_3d(climate_train)
-climate_test = clean_array_3d(climate_test)
-soil_train = clean_array_2d(soil_train)
-soil_test = clean_array_2d(soil_test)
-y_train = np.nan_to_num(y_train, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+y_train = clean_array(y_train)
 y_train = np.clip(y_train, 0.0, 200.0)
 
+# 标准化
 N, T, C = climate_train.shape
-S = soil_train.shape[1]
-
-climate_train_flat = climate_train.reshape(-1, C)
+climate_flat = climate_train.reshape(-1, C)
 climate_scaler = StandardScaler()
-climate_train_scaled_flat = climate_scaler.fit_transform(climate_train_flat)
-climate_train_scaled = climate_train_scaled_flat.reshape(N, T, C)
-climate_test_flat = climate_test.reshape(-1, C)
-climate_test_scaled = climate_scaler.transform(climate_test_flat).reshape(-1, T, C)
+climate_train_scaled = climate_scaler.fit_transform(climate_flat).reshape(N, T, C)
+climate_test_scaled = climate_scaler.transform(climate_test.reshape(-1, C)).reshape(-1, T, C)
 
 soil_scaler = StandardScaler()
 soil_train_scaled = soil_scaler.fit_transform(soil_train)
@@ -251,7 +312,7 @@ X_global_tr, X_global_val = X_global_train[tr_idx], X_global_train[val_idx]
 y_tr, y_val = y_train[tr_idx], y_train[val_idx]
 
 # ----------------------------
-# 4. 模型定义
+# 7. 模型定义
 # ----------------------------
 class YieldDataset(Dataset):
     def __init__(self, X_seq, X_global, y=None):
@@ -260,28 +321,18 @@ class YieldDataset(Dataset):
         self.y = torch.tensor(y, dtype=torch.float32) if y is not None else None
     def __len__(self): return len(self.X_seq)
     def __getitem__(self, i):
-        if self.y is not None:
-            return (self.X_seq[i], self.X_global[i]), self.y[i]
-        return (self.X_seq[i], self.X_global[i])
+        return (self.X_seq[i], self.X_global[i]), self.y[i] if self.y is not None else (self.X_seq[i], self.X_global[i])
 
 class TimeShiftedTransformerWithGlobal(nn.Module):
     def __init__(self, seq_len=12, input_dim=34, embed_dim=128, global_dim=1536, nhead=8, num_layers=2, dropout=0.1):
         super().__init__()
-        self.seq_len = seq_len
         self.embedding = nn.Linear(input_dim, embed_dim)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, nhead=nhead, dropout=dropout, batch_first=True
-        )
+        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=nhead, dropout=dropout, batch_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.global_proj = nn.Linear(global_dim, embed_dim)
-        self.dropout_global = nn.Dropout(dropout)  # ← 新增：防止过拟合
+        self.dropout_global = nn.Dropout(dropout)
         self.lag_weights = nn.Parameter(torch.randn(seq_len))
-        self.regressor = nn.Sequential(
-            nn.Linear(embed_dim * 2, 64),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, 1)
-        )
+        self.regressor = nn.Sequential(nn.Linear(embed_dim * 2, 64), nn.ReLU(), nn.Dropout(dropout), nn.Linear(64, 1))
         mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
         self.register_buffer("causal_mask", mask)
 
@@ -290,23 +341,18 @@ class TimeShiftedTransformerWithGlobal(nn.Module):
         out = self.transformer(x, mask=self.causal_mask)
         weights = torch.softmax(self.lag_weights, dim=0)
         seq_repr = (out * weights.unsqueeze(0).unsqueeze(-1)).sum(dim=1)
-        global_repr = self.global_proj(x_global)
-        global_repr = self.dropout_global(global_repr)  # ← 应用 dropout
+        global_repr = self.dropout_global(self.global_proj(x_global))
         fused = torch.cat([seq_repr, global_repr], dim=-1)
         return self.regressor(fused).squeeze(-1)
 
-# 动态设置 global_dim
-global_dim = X_global_tr.shape[1]
-
+# ----------------------------
+# 8. 训练
+# ----------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = TimeShiftedTransformerWithGlobal(
     seq_len=12,
     input_dim=X_seq_tr.shape[-1],
-    embed_dim=128,
-    global_dim=global_dim,
-    nhead=8,
-    num_layers=2,
-    dropout=0.1
+    global_dim=X_global_tr.shape[1]
 ).to(device)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
@@ -317,10 +363,9 @@ val_dataset = YieldDataset(X_seq_val, X_global_val, y_val)
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 
-# ----------------------------
-# 5. 训练
-# ----------------------------
 best_val_rmse = float('inf')
+suffix = "_with_context" if USE_GLOBAL_CONTEXT else "_no_context"
+
 for epoch in range(50):
     model.train()
     for (x_seq, x_global), y in train_loader:
@@ -339,61 +384,31 @@ for epoch in range(50):
             pred = model(x_seq, x_global)
             val_preds.append(pred.cpu().numpy())
             val_targets.append(y.cpu().numpy())
-
-    val_preds = np.concatenate(val_preds)
-    val_targets = np.concatenate(val_targets)
     val_rmse = np.sqrt(mean_squared_error(val_targets, val_preds))
-    val_var = np.var(val_targets - val_preds)
-
     if val_rmse < best_val_rmse:
         best_val_rmse = val_rmse
-        suffix = "_with_context" if USE_GLOBAL_CONTEXT else "_no_context"
         torch.save(model.state_dict(), f"best_model{suffix}.pth")
+    print(f"Epoch {epoch+1:2d} | Val RMSE: {val_rmse:.4f}")
 
-    print(f"Epoch {epoch+1:2d} | Val RMSE: {val_rmse:.4f} | Residual Var: {val_var:.4f}")
-
-# 加载最佳模型
-suffix = "_with_context" if USE_GLOBAL_CONTEXT else "_no_context"
+# ----------------------------
+# 9. 生成提交
+# ----------------------------
 model.load_state_dict(torch.load(f"best_model{suffix}.pth", map_location=device))
 model.eval()
-with torch.no_grad():
-    val_preds = []
-    for (x_seq, x_global), _ in val_loader:
-        x_seq, x_global = x_seq.to(device), x_global.to(device)
-        pred = model(x_seq, x_global)
-        val_preds.append(pred.cpu().numpy())
-    val_preds = np.concatenate(val_preds)
-    final_rmse = np.sqrt(mean_squared_error(y_val, val_preds))
-    final_var = np.var(y_val - val_preds)
-
-print(f"\n{'🟢 WITH CONTEXT' if USE_GLOBAL_CONTEXT else '🔴 WITHOUT CONTEXT'} Final Validation Metrics:")
-print(f"RMSE: {final_rmse:.4f}")
-print(f"Residual Variance: {final_var:.4f}")
-
-# 输出滞后权重
-lag_weights = torch.softmax(model.lag_weights, dim=0).detach().cpu().numpy()
-print("\n Learned lag weights (month 1 to 12):")
-for i, w in enumerate(lag_weights, 1):
-    marker = " ← GROWTH SEASON" if 4 <= i <= 9 else ""
-    print(f"  Month {i:2d}: {w:.4f}{marker}")
-
-# ----------------------------
-# 6. 生成提交文件
-# ----------------------------
 test_dataset = YieldDataset(X_test_seq, X_global_test)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 with torch.no_grad():
-    test_preds = []
+    preds = []
     for x_seq, x_global in test_loader:
         x_seq, x_global = x_seq.to(device), x_global.to(device)
         pred = model(x_seq, x_global)
-        test_preds.append(pred.cpu().numpy())
-    test_preds = np.concatenate(test_preds)
+        preds.append(pred.cpu().numpy())
+    preds = np.concatenate(preds)
 
 submission = pd.DataFrame({
     "Field_ID": test_df["Field_ID"],
-    "Yield": np.clip(test_preds, 0, None)
+    "Yield": np.clip(preds, 0, None)
 })
-output_file = f"submission{suffix}.csv"
-submission.to_csv(output_file, index=False)
-print(f"\n✅ Submission saved to {output_file}")
+submission.to_csv(f"submission{suffix}.csv", index=False)
+print(f"\n✅ 提交文件已保存: submission{suffix}.csv")
+print(f"🎯 Embedding 有效性判断: {'有效' if EMBEDDING_IS_VALID else '无效'}")
