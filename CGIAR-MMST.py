@@ -21,7 +21,7 @@ except ImportError:
     raise ImportError("请安装依赖: pip install dashscope tiktoken")
 
 # 🔑 替换为你的阿里云 API Key
-dashscope.api_key = "sk-ws-H.RELLMHI.9h7x.MEQCIE6Un0PjMifFnCYw1JbxF2WcOXMEIlOl7w5xDwZL9Y9AAiAZmvjWMrhPvr4VctLBz9Ueiu8XAfbGcOszBREMda4f2w"
+dashscope.api_key = "sk-ws-H.RELLMXP.8mfq.MEUCIHLPtzj3b0pYo2rmNHOosH_Gf62E2OTattvkRytEqeiwAiEA8I8wtVh2XvMdmoh4H5FmB2JWnJCdbmw5wHjWKjukW3A"
 
 def split_text_into_chunks(text: str, max_tokens: int = 2000) -> list[str]:
     encoding = tiktoken.get_encoding("cl100k_base")
