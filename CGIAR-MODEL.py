@@ -22,7 +22,7 @@ try:
 except ImportError:
     raise ImportError("请安装依赖: pip install dashscope")
 
-dashscope.api_key = "sk-65aa3b4c924b43e29bbffe9430eeb010"  # ← 替换为你的 Key
+dashscope.api_key = "sk-ws-H.RELLDYE.4yZ0.MEUCIQCwwp0eNnXiESR1SiSohy4xGi5JSiV1dtga7XXrXTTdEwIgG6DbRUEK8-W-sNQlfMl9BC9T05LQqwhe_O4U3AA9sEE"  # ← 替换为你的 Key
 
 def get_single_embedding(text: str, model: str = "text-embedding-v2") -> np.ndarray:
     response = TextEmbedding.call(model=model, input=text.strip())
